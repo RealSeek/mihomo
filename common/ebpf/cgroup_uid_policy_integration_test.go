@@ -30,8 +30,8 @@ var (
 // destination resolves only through the proxy, so it is intercepted for a
 // bypassed UID too. A helper process in the test cgroup sends from one UDP
 // socket under both UIDs, and the listener port shows which datagrams the
-// sendmsg program redirected. It runs once per cgroup object that can carry
-// sendmsg on this kernel.
+// sendmsg program redirected. It runs against both cgroup objects, the
+// coarse-clock one and the plain one.
 func TestCgroupUIDPolicyPrecedesTheFlowCacheIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "send UDP through the cgroup programs under two UIDs")
 	root, err := DetectCgroup2Root()
@@ -39,11 +39,9 @@ func TestCgroupUIDPolicyPrecedesTheFlowCacheIntegration(t *testing.T) {
 		t.Skipf("cgroup v2 is unavailable: %v", err)
 	}
 	variants := []struct {
-		name    string
-		storage bool
-		coarse  bool
+		name   string
+		coarse bool
 	}{
-		{name: "socket_storage", storage: true, coarse: true},
 		{name: "coarse_time", coarse: true},
 		{name: "plain"},
 	}
@@ -94,25 +92,14 @@ func TestCgroupUIDPolicyPrecedesTheFlowCacheIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = backend.Close() })
-			if variant.storage && !backend.runtime.socket_storage_supported {
-				// Also the case wherever the stripped object cannot create its
-				// SK_STORAGE map, which the kernel refuses without BTF types.
-				t.Skip("socket storage fast path is unavailable")
-			}
 			if variant.coarse && !backend.runtime.coarse_time_supported {
 				t.Skip("kernel lacks the coarse clock helper")
-			}
-			if !variant.storage {
-				backend.disableSocketStorage()
 			}
 			if !variant.coarse {
 				backend.runtime.coarse_time_supported = false
 			}
 			if err = backend.LoadPrograms(listenerPort); err != nil {
 				t.Fatal(err)
-			}
-			if variant.storage != backend.runtime.socket_storage_supported {
-				t.Fatalf("socket storage variant did not load: supported=%v", backend.runtime.socket_storage_supported)
 			}
 			if err = backend.Attach(); err != nil {
 				t.Fatal(err)

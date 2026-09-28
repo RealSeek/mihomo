@@ -1685,6 +1685,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		if asnNumber != "" && !smart.SharedASNs[asnNumber] {
 			if kind := smart.ClassifyTargetName(target); kind == smart.TargetKindRuleName || kind == smart.TargetKindService {
 				atomicRecord.AddASNEvidence(asnNumber)
+				s.store.RecordASNEvidence(s.Name(), s.configName, target, asnNumber)
 			}
 		}
 	}

@@ -292,6 +292,7 @@ func (s *Store) AdjustCacheParameters() {
 // 按级别清理内存缓存
 func (s *Store) clearCache(level string, config string, group string) {
 	s.FlushQueue(true)
+	invalidateASNEvidence(level, config, group)
 
 	if level == "all" {
 		targetCache.Clear()

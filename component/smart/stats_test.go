@@ -100,3 +100,25 @@ func TestCheckHostStatusDropsOnlyLegacyLongAbnormalBlocks(t *testing.T) {
 	require.NotContains(t, codeSet.Nodes, "legacy")
 	require.Contains(t, codeSet.Nodes, "backed-off")
 }
+
+// The evidence behind network claims is cached between rebuilds, so a flush has
+// to drop that cache too, or the flushed counts keep backing claims.
+func TestFlushDropsCachedASNEvidence(t *testing.T) {
+	InitCache()
+	InitQueue()
+	store := &Store{}
+	const (
+		group    = "flush-evidence-group"
+		config   = "config"
+		ruleName = "RuleSet [example-video]"
+	)
+	t.Cleanup(func() { invalidateASNEvidence("group", config, group) })
+
+	require.Empty(t, store.TargetASNEvidence(group, config))
+	store.RecordASNEvidence(group, config, ruleName, "64512")
+	require.Equal(t, 1, store.TargetASNEvidence(group, config)[ruleName]["64512"],
+		"fixture did not record the evidence")
+
+	require.NoError(t, store.FlushByGroup(group, config))
+	require.Empty(t, store.TargetASNEvidence(group, config), "flushed evidence still backs claims")
+}

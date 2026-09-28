@@ -577,24 +577,29 @@ INLINE int handle_v4(
     }
     __u8 flow_address[16] = {0};
     __builtin_memcpy(flow_address, &destination, sizeof(destination));
+    __u8 destination_bytes[4];
+    __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
+    bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv4(
+        destination_bytes,
+        config->flags,
+        SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4,
+        config->fakeip_ipv4_prefix,
+        config->fakeip_ipv4_mask);
+    // UID policy belongs to the task sending, not to the socket, so it goes
+    // ahead of the UDP flow cache: a socket that a bypassed UID inherited or
+    // shares must not reuse the proxy decision cached for an earlier sender. A
+    // fake-ip destination resolves only through the proxy, so it is intercepted
+    // whatever the UID, as the TC path does. Hijacked DNS already was.
+    if (!force_dns && !force_fakeip && uid_bypassed(config)) return 1;
     if (!connect_hook) {
         int cached = flow_action(
             ctx, config, AF_INET_VALUE, protocol, port, flow_address, cookie, false,
             socket_storage_context);
         if (cached == FLOW_CACHE_PROXY || (!intercept_dns && cached == FLOW_CACHE_BYPASS)) return 1;
     }
-    if (!force_dns && uid_bypassed(config)) return 1;
-    __u8 destination_bytes[4];
-    __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
     if (!intercept_dns) {
         if (sb_ebpf_ipv4_safety_bypass(destination_bytes)) return 1;
         if ((config->flags & SB_EBPF_CGROUP_FLAG_HOST_IPV4) != 0U && host_ipv4(destination)) return 1;
-        bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv4(
-            destination_bytes,
-            config->flags,
-            SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4,
-            config->fakeip_ipv4_prefix,
-            config->fakeip_ipv4_mask);
         if (!force_fakeip &&
             (((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
                 sb_ebpf_ipv4_private_address(destination_bytes)) ||
@@ -677,24 +682,26 @@ INLINE int handle_v6(
         }
         __u8 flow_address[16] = {0};
         __builtin_memcpy(flow_address, &destination, sizeof(destination));
+        __u8 destination_bytes[4];
+        __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
+        bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv4(
+            destination_bytes,
+            config->flags,
+            SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4,
+            config->fakeip_ipv4_prefix,
+            config->fakeip_ipv4_mask);
+        // UID policy goes ahead of the UDP flow cache and yields to fake-ip; see
+        // handle_v4.
+        if (!force_dns && !force_fakeip && uid_bypassed(config)) return 1;
         if (!connect_hook) {
             int cached = flow_action(
                 ctx, config, AF_INET_VALUE, protocol, port, flow_address, cookie, true,
                 socket_storage_context);
             if (cached == FLOW_CACHE_PROXY || (!intercept_dns && cached == FLOW_CACHE_BYPASS)) return 1;
         }
-        if (!force_dns && uid_bypassed(config)) return 1;
-        __u8 destination_bytes[4];
-        __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
         if (!intercept_dns) {
             if (sb_ebpf_ipv4_safety_bypass(destination_bytes)) return 1;
             if ((config->flags & SB_EBPF_CGROUP_FLAG_HOST_IPV4) != 0U && host_ipv4(destination)) return 1;
-            bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv4(
-                destination_bytes,
-                config->flags,
-                SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4,
-                config->fakeip_ipv4_prefix,
-                config->fakeip_ipv4_mask);
             if (!force_fakeip &&
                 (((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
                     sb_ebpf_ipv4_private_address(destination_bytes)) ||
@@ -749,22 +756,24 @@ INLINE int handle_v6(
     }
     __u8 flow_address[16];
     __builtin_memcpy(flow_address, address, sizeof(flow_address));
+    bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv6(
+        (const __u8 *)address,
+        config->flags,
+        SB_EBPF_CGROUP_FLAG_FAKEIP_IPV6,
+        config->fakeip_ipv6_prefix,
+        config->fakeip_ipv6_mask);
+    // UID policy goes ahead of the UDP flow cache and yields to fake-ip; see
+    // handle_v4.
+    if (!force_dns && !force_fakeip && uid_bypassed(config)) return 1;
     if (!connect_hook) {
         int cached = flow_action(
             ctx, config, AF_INET6_VALUE, protocol, port, flow_address, cookie, false,
             socket_storage_context);
         if (cached == FLOW_CACHE_PROXY || (!intercept_dns && cached == FLOW_CACHE_BYPASS)) return 1;
     }
-    if (!force_dns && uid_bypassed(config)) return 1;
     if (!intercept_dns) {
         if (sb_ebpf_ipv6_safety_bypass((const __u8 *)address)) return 1;
         if ((config->flags & SB_EBPF_CGROUP_FLAG_HOST_IPV6) != 0U && host_ipv6(address)) return 1;
-        bool force_fakeip = sb_ebpf_must_intercept_fakeip_ipv6(
-            (const __u8 *)address,
-            config->flags,
-            SB_EBPF_CGROUP_FLAG_FAKEIP_IPV6,
-            config->fakeip_ipv6_prefix,
-            config->fakeip_ipv6_mask);
         if (!force_fakeip &&
             (((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
                 sb_ebpf_ipv6_private_address((const __u8 *)address)) ||

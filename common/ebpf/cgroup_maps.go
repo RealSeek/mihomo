@@ -10,6 +10,7 @@ import (
 	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/features"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
 
@@ -178,14 +179,25 @@ func probeSocketReleaseSupport(cgroupFD int) (bool, error) {
 		},
 	})
 	if err != nil {
-		if socketReleaseUnavailable(err) {
+		if socketReleaseProbeUnavailable(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	if err = attachProgramRaw(cgroupFD, program, CiliumEBPF.AttachCgroupInetSockRelease); err != nil {
+	// Attach the probe alongside whatever is there, never in place of it. The
+	// exclusive fallback attachProgramRaw ends with would replace another
+	// owner's program on this hook, and the detach below would then leave the
+	// hook empty. Where only that would have worked, the refusal is EPERM and
+	// the probe reports the hook as unavailable.
+	err = link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  cgroupFD,
+		Program: program,
+		Attach:  CiliumEBPF.AttachCgroupInetSockRelease,
+		Flags:   unix.BPF_F_ALLOW_MULTI,
+	})
+	if err != nil {
 		closeErr := program.Close()
-		if socketReleaseUnavailable(err) {
+		if socketReleaseProbeUnavailable(err) {
 			return false, closeErr
 		}
 		return false, E.Errors(err, closeErr)
@@ -199,6 +211,16 @@ func probeSocketReleaseSupport(cgroupFD int) (bool, error) {
 		return false, closeErr
 	}
 	return true, nil
+}
+
+// socketReleaseProbeUnavailable reports whether the probe found the socket-release
+// hook unusable. The hook only speeds up UDP cleanup, the LRU maps work without
+// it, so a permission refusal counts too: some Android kernels allow the cgroup
+// data plane but reject this attach type with EPERM or EACCES (SELinux or a vendor
+// policy). Treating that as fatal failed the whole cgroup inbound, TCP included.
+// The required cgroup hooks still report permission errors to the caller.
+func socketReleaseProbeUnavailable(err error) bool {
+	return socketReleaseUnavailable(err) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
 }
 
 func socketReleaseUnavailable(err error) bool {

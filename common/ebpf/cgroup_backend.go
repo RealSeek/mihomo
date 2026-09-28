@@ -80,6 +80,10 @@ type cgroupRuntime struct {
 	bypass_ipv4_policy          bool
 	bypass_ipv6_policy          bool
 	bypass_port_policy          bool
+
+	// displaced holds, per slot, the program another owner had attached
+	// exclusively and the exclusive fallback replaced; detach puts it back.
+	displaced [cgroupProgramCount]*CiliumEBPF.Program
 }
 
 type CgroupBackend struct {

@@ -184,11 +184,11 @@ func probeSocketReleaseSupport(cgroupFD int) (bool, error) {
 		}
 		return false, err
 	}
-	// Attach the probe alongside whatever is there, never in place of it. The
-	// exclusive fallback attachProgramRaw ends with would replace another
-	// owner's program on this hook, and the detach below would then leave the
-	// hook empty. Where only that would have worked, the refusal is EPERM and
-	// the probe reports the hook as unavailable.
+	// Attach the probe alongside whatever is there, never in place of it. An
+	// in-place attach would replace another owner's program on this hook, and
+	// the detach below would then leave the hook empty. Where only that would
+	// have worked, the refusal is EPERM and the probe reports the hook as
+	// unavailable.
 	err = link.RawAttachProgram(link.RawAttachProgramOptions{
 		Target:  cgroupFD,
 		Program: program,

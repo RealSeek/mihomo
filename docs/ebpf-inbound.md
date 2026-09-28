@@ -254,6 +254,14 @@ overridden with `cgroup-path`. Package policy is resolved to Android UIDs and
 `include-android-user` maps a user ID to its per-user UID range. The DNS
 tethering UID is always excluded.
 
+From Android 15, netd attaches its own connect, sendmsg and recvmsg programs to
+the cgroup v2 root exclusively, and nothing can attach beside them or below
+them. The cgroup data plane then takes those hooks over, logs which ones, and
+hands them back to netd's programs when the inbound stops. If mihomo is killed
+instead, its programs stay attached until it starts again and removes them, and
+netd's come back only when netd attaches again, normally at the next boot.
+`local.data-plane: tc` leaves the hooks alone.
+
 SELinux must permit BPF map/program creation, cgroup attach, and socket
 operations for the mihomo domain. On restricted Android builds the feature is
 usually only usable from a root or Magisk-provided service context. Run

@@ -80,6 +80,22 @@ listeners:
 
 配好之后这些网段的 TCP / UDP 包在内核里直接放行，mihomo 的连接列表里看不到它们——这是正常的，说明生效了。上面那个 `cn.mrs` 同时含 IPv4 和 IPv6 网段。规则集内容变化后每 3 秒自动同步进内核，不用重启。
 
+顶层的 `bypass-rule-set` 对本机和共享两个角色都生效。只想对其中一个生效，就写在 `local.bypass-rule-set` 或 `shared.bypass-rule-set` 里，它们叠加在顶层列表之上。比如本机的国内 IP 直连、热点下的设备全部走代理：
+
+```yaml
+listeners:
+  - name: ebpf-in
+    type: ebpf
+    local:
+      enable: true
+      bypass-rule-set: [CN-IP]
+    shared:
+      enable: true
+      interface: [wlan0]
+```
+
+`local.enable` / `shared.enable` 是 sing-box 的写法，和 `mode` 二选一，旧的 `mode` 写法照常可用。
+
 ## 注意事项（这几条不看会踩坑）
 
 - **DNS 永远走核心，不受 bypass 影响。** `dns-mode: hijack` 时 53 端口无条件劫持进核心，内核里 DNS 判断排在所有 CIDR 判断之前。所以基于 DNS 的广告拦截（`nameserver-policy` 配 `rcode://success` 那种）照常工作，不会因为开了 CN IP 直连就失效。

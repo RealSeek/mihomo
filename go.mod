@@ -36,7 +36,7 @@ require (
 	github.com/metacubex/restls-client-go v0.1.9
 	github.com/metacubex/sevenzip v1.6.4
 	github.com/metacubex/sing v0.5.8
-	github.com/metacubex/sing-mux v0.3.11
+	github.com/metacubex/sing-mux v0.3.12-0.20260926224830-714fc2e099f2
 	github.com/metacubex/sing-quic v0.0.0-20260904234848-1c242664697a
 	github.com/metacubex/sing-shadowsocks v0.2.13
 	github.com/metacubex/sing-shadowsocks2 v0.2.8
@@ -151,5 +151,3 @@ require (
 
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
-
-replace github.com/metacubex/sing-mux => github.com/liuran001/sing-mux v0.3.12-0.20260925051223-e8f844c58205

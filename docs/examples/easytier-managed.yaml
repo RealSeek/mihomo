@@ -1,0 +1,47 @@
+# Windows requires elevation; Android runs through root / su.
+# Replace the configuration-server endpoint/token and controller secret.
+mode: rule
+log-level: info
+ipv6: true
+allow-lan: false
+external-controller: 127.0.0.1:9090
+secret: CHANGE_ME_CONTROLLER_SECRET
+
+dns:
+  enable: true
+  listen: 127.0.0.1:53
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+tun:
+  enable: true
+  device: Mihomo
+  stack: mips
+  file-descriptor: 0
+  auto-route: true
+  auto-detect-interface: true
+  mtu: 1380
+  gso: false
+  auto-redirect: false
+  dns-hijack:
+    - any:53
+  easytier:
+    - managed
+
+proxies:
+  - name: managed
+    type: easytier
+    state-dir: easytier/managed
+    web-client:
+      endpoint: tcp://config.example.test:22020/CHANGE_ME_TOKEN
+      # The omitted machine-id is generated once in state-dir.
+      # Set a different hostname on each device when desired.
+      hostname: mihomo-managed
+      secure-mode: false
+
+rules:
+  - MATCH,DIRECT

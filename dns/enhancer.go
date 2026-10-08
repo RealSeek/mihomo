@@ -18,6 +18,7 @@ type ResolverEnhancer struct {
 	fakeIPTTL     int
 	mapping       *lru.LruCache[netip.Addr, string]
 	useHosts      bool
+	easyTier      []EasyTierNetwork
 }
 
 func (h *ResolverEnhancer) FakeIPEnabled() bool {
@@ -166,6 +167,7 @@ type EnhancerConfig struct {
 	FakeIPSkipper *fakeip.Skipper
 	FakeIPTTL     int
 	UseHosts      bool
+	EasyTier      []EasyTierNetwork
 }
 
 func NewEnhancer(cfg EnhancerConfig) *ResolverEnhancer {
@@ -173,6 +175,7 @@ func NewEnhancer(cfg EnhancerConfig) *ResolverEnhancer {
 		ipv6:     cfg.IPv6,
 		mode:     cfg.EnhancedMode,
 		useHosts: cfg.UseHosts,
+		easyTier: cfg.EasyTier,
 	}
 
 	if cfg.EnhancedMode != C.DNSNormal {

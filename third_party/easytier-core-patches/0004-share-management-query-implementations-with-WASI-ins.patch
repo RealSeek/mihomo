@@ -1,0 +1,104 @@
+From 606c890cbe651d8110f7d9de837f790d66bf622d Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 8 Oct 2026 02:14:06 +0800
+Subject: [PATCH 4/6] share management query implementations with WASI
+ instances
+
+---
+ .../src/management/instance_rpc/full.rs       | 25 ++++++++-----------
+ easytier-core/src/management/mod.rs           |  3 +--
+ 2 files changed, 11 insertions(+), 17 deletions(-)
+
+diff --git a/easytier-core/src/management/instance_rpc/full.rs b/easytier-core/src/management/instance_rpc/full.rs
+index 4431e76..0d3f95e 100644
+--- a/easytier-core/src/management/instance_rpc/full.rs
++++ b/easytier-core/src/management/instance_rpc/full.rs
+@@ -114,10 +114,9 @@ fn credential_info_to_api(info: CoreCredentialInfo) -> CredentialInfo {
+ }
+ 
+ #[async_trait::async_trait]
+-impl<F, H> MappedListenerManageRpc for InstanceManagementRpc<F>
++impl<R> MappedListenerManageRpc for ResolvedInstanceManagementRpc<R>
+ where
+-    F: InstanceFactory<Instance = CoreInstance<H>>,
+-    H: CoreInstanceHost,
++    R: ReadOnlyInstanceResolver,
+ {
+     type Controller = BaseController;
+ 
+@@ -184,10 +183,9 @@ fn vpn_portal_info_to_proto(info: PortalInfoSnapshot) -> VpnPortalInfo {
+ }
+ 
+ #[async_trait::async_trait]
+-impl<F, H> VpnPortalRpc for InstanceManagementRpc<F>
++impl<R> VpnPortalRpc for ResolvedInstanceManagementRpc<R>
+ where
+-    F: InstanceFactory<Instance = CoreInstance<H>>,
+-    H: CoreInstanceHost,
++    R: ReadOnlyInstanceResolver,
+ {
+     type Controller = BaseController;
+ 
+@@ -207,10 +205,9 @@ where
+ }
+ 
+ #[async_trait::async_trait]
+-impl<F, H> AclManageRpc for InstanceManagementRpc<F>
++impl<R> AclManageRpc for ResolvedInstanceManagementRpc<R>
+ where
+-    F: InstanceFactory<Instance = CoreInstance<H>>,
+-    H: CoreInstanceHost,
++    R: ReadOnlyInstanceResolver,
+ {
+     type Controller = BaseController;
+ 
+@@ -240,10 +237,9 @@ where
+ }
+ 
+ #[async_trait::async_trait]
+-impl<F, H> PortForwardManageRpc for InstanceManagementRpc<F>
++impl<R> PortForwardManageRpc for ResolvedInstanceManagementRpc<R>
+ where
+-    F: InstanceFactory<Instance = CoreInstance<H>>,
+-    H: CoreInstanceHost,
++    R: ReadOnlyInstanceResolver,
+ {
+     type Controller = BaseController;
+ 
+@@ -267,10 +263,9 @@ where
+ }
+ 
+ #[async_trait::async_trait]
+-impl<F, H> StatsRpc for InstanceManagementRpc<F>
++impl<R> StatsRpc for ResolvedInstanceManagementRpc<R>
+ where
+-    F: InstanceFactory<Instance = CoreInstance<H>>,
+-    H: CoreInstanceHost,
++    R: ReadOnlyInstanceResolver,
+ {
+     type Controller = BaseController;
+ 
+diff --git a/easytier-core/src/management/mod.rs b/easytier-core/src/management/mod.rs
+index 389cec9..efc9729 100644
+--- a/easytier-core/src/management/mod.rs
++++ b/easytier-core/src/management/mod.rs
+@@ -18,7 +18,7 @@ use crate::{
+ use easytier_proto::api::instance::{
+     AclManageRpcServer, ConnectorManageRpcServer, CredentialManageRpcServer,
+     MappedListenerManageRpcServer, PeerManageRpcServer, PortForwardManageRpcServer,
+-    StatsRpcServer, TcpProxyRpcServer, VpnPortalRpcServer,
++    StatsRpcServer, VpnPortalRpcServer,
+ };
+ #[cfg(all(feature = "management", target_os = "wasi"))]
+ use easytier_proto::api::config::ConfigRpcServer;
+@@ -83,7 +83,6 @@ pub(crate) fn register_bound_management_rpc<H>(
+     registry.register(ConnectorManageRpcServer::new(rpc.clone()), "");
+     registry.register(MappedListenerManageRpcServer::new(rpc.clone()), "");
+     registry.register(VpnPortalRpcServer::new(rpc.clone()), "");
+-    registry.register(TcpProxyRpcServer::new(rpc.clone()), "");
+     registry.register(AclManageRpcServer::new(rpc.clone()), "");
+     registry.register(PortForwardManageRpcServer::new(rpc.clone()), "");
+     registry.register(StatsRpcServer::new(rpc.clone()), "");
+-- 
+2.55.0.windows.5
+

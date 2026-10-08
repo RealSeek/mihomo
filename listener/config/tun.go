@@ -16,6 +16,7 @@ type Tun struct {
 	DNSHijack           []string   `yaml:"dns-hijack" json:"dns-hijack"`
 	AutoRoute           bool       `yaml:"auto-route" json:"auto-route"`
 	AutoDetectInterface bool       `yaml:"auto-detect-interface" json:"auto-detect-interface"`
+	EasyTier            []string   `yaml:"easytier" json:"easytier,omitempty"`
 
 	MTU                                   uint32         `yaml:"mtu" json:"mtu,omitempty"`
 	GSO                                   bool           `yaml:"gso" json:"gso,omitempty"`
@@ -97,6 +98,9 @@ func (t *Tun) Sort() {
 }
 
 func (t *Tun) Equal(other Tun) bool {
+	if !slices.Equal(t.EasyTier, other.EasyTier) {
+		return false
+	}
 	if t.Enable != other.Enable {
 		return false
 	}

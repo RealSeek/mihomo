@@ -304,6 +304,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) (releaseCache func()) {
 		FakeIPSkipper: c.FakeIPSkipper,
 		FakeIPTTL:     c.FakeIPTTL,
 		UseHosts:      c.UseHosts,
+		EasyTier:      c.EasyTier,
 	})
 
 	// reuse cache of old host mapper
@@ -341,6 +342,34 @@ func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
 }
 
 func updateProxies(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider) {
+	outdated := make(map[C.ProxyAdapter]string)
+	for _, proxy := range tunnel.Proxies() {
+		if proxy.Type() == C.EasyTier {
+			outdated[proxy.Adapter()] = proxy.Name()
+		}
+	}
+	for _, provider := range tunnel.Providers() {
+		for _, proxy := range provider.Proxies() {
+			if proxy.Type() == C.EasyTier {
+				outdated[proxy.Adapter()] = proxy.Name()
+			}
+		}
+	}
+	for _, proxy := range proxies {
+		delete(outdated, proxy.Adapter())
+	}
+	for _, provider := range providers {
+		for _, proxy := range provider.Proxies() {
+			delete(outdated, proxy.Adapter())
+		}
+	}
+	// EasyTier owns persistent listeners and a reconnect loop, so replacement
+	// must finish teardown before the new instance can bind the same ports.
+	for adapter, name := range outdated {
+		if err := adapter.Close(); err != nil {
+			log.Warnln("[EasyTier](%s) close replaced instance: %v", name, err)
+		}
+	}
 	tunnel.UpdateProxies(proxies, providers)
 }
 

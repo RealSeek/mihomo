@@ -1,0 +1,45 @@
+# Run through root / su. Fill in both secrets before starting.
+# Keep automatic interface detection enabled for Wi-Fi/mobile-data handover.
+mode: rule
+log-level: info
+ipv6: true
+allow-lan: false
+external-controller: 127.0.0.1:19090
+secret: CHANGE_ME_CONTROLLER_SECRET
+
+tun:
+  enable: true
+  device: etmesh0
+  stack: mips
+  file-descriptor: 0
+  auto-route: true
+  auto-detect-interface: true
+  iproute2-table-index: 42023
+  iproute2-rule-index: 8000
+  route-address: [10.126.0.0/24]
+  mtu: 1360
+  gso: false
+  auto-redirect: false
+  easytier: [mesh]
+
+proxies:
+  - name: mesh
+    type: easytier
+    network-name: RealSeek-EasyTierNetwork
+    network-secret: CHANGE_ME_NETWORK_SECRET
+    hostname: RealSeek-Mihomo-Phone
+    instance-name: RealSeek-EasyTierNetwork-Mihomo-Phone
+    dhcp: true
+    ipv6-public-addr-auto: true
+    mtu: 1360
+    udp: true
+    accept-dns: true
+    latency-first: true
+    need-p2p: true
+    disable-upnp: true
+    listeners:
+      - tcp://0.0.0.0:11010
+      - udp://0.0.0.0:11010
+    peers: [tcp://easytier.weiai.org.cn:11010]
+
+rules: ['MATCH,DIRECT']

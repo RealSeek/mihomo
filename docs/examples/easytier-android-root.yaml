@@ -1,0 +1,62 @@
+# Run this fork's Android mihomo binary through root / su.
+# Replace both CHANGE_ME secrets in both device configurations before use.
+# Replace 203.0.113.10 with a reachable address of the desktop TCP listener.
+# Run the arm64 mihomo binary through su. Keep auto-detect-interface enabled so
+# peer connections follow Wi-Fi/mobile-data handover; do not pin interface-name.
+mode: rule
+log-level: info
+ipv6: true
+allow-lan: false
+external-controller: 127.0.0.1:9090
+secret: CHANGE_ME_CONTROLLER_SECRET
+
+dns:
+  enable: true
+  listen: 127.0.0.1:53
+  ipv6: true
+  use-hosts: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+tun:
+  enable: true
+  device: Mihomo
+  stack: mips
+  file-descriptor: 0
+  auto-route: true
+  auto-detect-interface: true
+  mtu: 1380
+  gso: false
+  auto-redirect: false
+  dns-hijack:
+    - any:53
+  easytier:
+    - mesh
+
+proxies:
+  - name: mesh
+    type: easytier
+    network-name: mihomo-mesh
+    network-secret: CHANGE_ME_NETWORK_SECRET
+    hostname: phone
+    ipv4: 10.144.0.2/24
+    ipv6: fd00:144::2/64
+    dhcp: false
+    tld-dns-zone: et.net
+    mtu: 1380
+    udp: true
+    enable-encryption: true
+    instance-name: mesh-phone
+    state-dir: easytier/mesh
+    no-listener: true
+    peers:
+      - tcp://203.0.113.10:11010
+
+rules:
+  - MATCH,DIRECT

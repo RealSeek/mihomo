@@ -175,6 +175,21 @@ func TestRenderTOMLStaticIPv4OmitsDHCP(t *testing.T) {
 	}
 }
 
+func TestRenderTOMLWritesManualRoutes(t *testing.T) {
+	routes := []string{"192.0.2.0/24", "198.51.100.7/32"}
+	toml, err := Config{
+		NetworkName: "example",
+		Peers:       peers("tcp://192.0.2.10:11010"),
+		Routes:      &routes,
+	}.RenderTOML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(toml, `routes = ["192.0.2.0/24", "198.51.100.7/32"]`) {
+		t.Fatalf("missing manual routes:\n%s", toml)
+	}
+}
+
 func TestRenderTOMLWritesTLDDNSZone(t *testing.T) {
 	toml, err := Config{
 		NetworkName:   "example",
@@ -187,6 +202,111 @@ func TestRenderTOMLWritesTLDDNSZone(t *testing.T) {
 	}
 	if !strings.Contains(toml, `tld_dns_zone = "overlay.example."`) {
 		t.Fatalf("missing tld_dns_zone:\n%s", toml)
+	}
+}
+
+func TestRenderTOMLWritesSocks5Proxy(t *testing.T) {
+	toml, err := Config{
+		NetworkName: "example",
+		Peers:       peers("tcp://192.0.2.10:11010"),
+		Socks5Proxy: "socks5://127.0.0.1:1080",
+	}.RenderTOML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(toml, `socks5_proxy = "socks5://127.0.0.1:1080"`) {
+		t.Fatalf("missing socks5 proxy:\n%s", toml)
+	}
+}
+
+func TestValidateStructuredSocks5Proxy(t *testing.T) {
+	base := Config{
+		NetworkName: "example",
+		Peers:       peers("tcp://192.0.2.10:11010"),
+	}
+	for _, value := range []string{
+		"http://127.0.0.1:1080",
+		"socks5://127.0.0.1",
+		"socks5://proxy.example.test:1080",
+		"socks5://127.0.0.1:1080/path",
+		"socks5://127.0.0.1:0",
+		"socks5://[::1]:1080",
+	} {
+		base.Socks5Proxy = value
+		if err := base.ValidateStructured(); err == nil {
+			t.Errorf("expected invalid socks5-proxy %q to fail", value)
+		}
+	}
+
+	base.Socks5Proxy = "socks5://127.0.0.1:1080"
+	if err := base.ValidateStructured(); err != nil {
+		t.Fatalf("valid IPv4 socks5-proxy rejected: %v", err)
+	}
+}
+
+func TestRenderTOMLWritesOfficialTransportAndRelayFlags(t *testing.T) {
+	foreignLimit := uint64(1234)
+	recvLimit := uint64(5678)
+	mark := uint32(42)
+	toml, err := Config{
+		NetworkName:                   "example",
+		NetworkSecret:                 "secret",
+		Peers:                         peers("tcp://192.0.2.10:11010"),
+		IPv6PublicAddrProvider:        boolPtr(true),
+		IPv6PublicAddrAuto:            boolPtr(false),
+		IPv6PublicAddrPrefix:          "2001:db8:1::/48",
+		TCPSTUNServers:                []string{"stun.example.test:3478"},
+		TCPWhitelist:                  []string{"80", "443"},
+		UDPWhitelist:                  []string{"53"},
+		DefaultProtocol:               "udp",
+		DevName:                       "mihomo-et",
+		EnableIPv6:                    boolPtr(false),
+		ProxyForwardBySystem:          boolPtr(true),
+		RelayNetworkWhitelist:         "corp,prod",
+		P2POnly:                       boolPtr(true),
+		RelayAllPeerRPC:               boolPtr(true),
+		DisableRelayKCP:               boolPtr(true),
+		EnableRelayForeignNetworkKCP:  boolPtr(true),
+		DisableRelayQUIC:              boolPtr(true),
+		EnableRelayForeignNetworkQUIC: boolPtr(true),
+		ForeignRelayBPSLimit:          &foreignLimit,
+		InstanceRecvBPSLimit:          &recvLimit,
+		MultiThread:                   boolPtr(false),
+		MultiThreadCount:              4,
+		DataCompressAlgo:              "Zstd",
+		DisableUPnP:                   boolPtr(true),
+		DisableRelayData:              boolPtr(true),
+		PreferPeerRelay:               boolPtr(true),
+		EnableUDPBroadcastRelay:       boolPtr(true),
+		QUICListenPort:                23456,
+		SocketMark:                    &mark,
+	}.RenderTOML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`ipv6_public_addr_provider = true`,
+		`ipv6_public_addr_auto = false`,
+		`ipv6_public_addr_prefix = "2001:db8:1::/48"`,
+		`tcp_stun_servers = ["stun.example.test:3478"]`,
+		`tcp_whitelist = ["80", "443"]`,
+		`udp_whitelist = ["53"]`,
+		`default_protocol = "udp"`,
+		`enable_ipv6 = false`,
+		`relay_network_whitelist = "corp,prod"`,
+		`p2p_only = true`,
+		`disable_relay_kcp = true`,
+		`enable_relay_foreign_network_quic = true`,
+		`foreign_relay_bps_limit = "1234"`,
+		`instance_recv_bps_limit = "5678"`,
+		`data_compress_algo = "Zstd"`,
+		`disable_relay_data = true`,
+		`quic_listen_port = 23456`,
+		`socket_mark = 42`,
+	} {
+		if !strings.Contains(toml, expected) {
+			t.Fatalf("missing %q:\n%s", expected, toml)
+		}
 	}
 }
 

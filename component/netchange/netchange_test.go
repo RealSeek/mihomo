@@ -1,6 +1,7 @@
 package netchange
 
 import (
+	"context"
 	"slices"
 	"sync"
 	"testing"
@@ -49,7 +50,8 @@ func newTestNotifier(r *recorder, flushCache func()) *notifier {
 				flushCache()
 			}
 		},
-		resetConnection: func() { r.record("reset") },
+		resetConnection:    func() { r.record("reset") },
+		refreshEnvironment: func(context.Context) { r.record("environment") },
 		providers: func() map[string]P.ProxyProvider {
 			return map[string]P.ProxyProvider{"test": &stubProvider{recorder: r}}
 		},
@@ -69,7 +71,7 @@ func TestNotifyRunsEveryStage(t *testing.T) {
 	r := &recorder{}
 	waitDone(t, newTestNotifier(r, nil).notify())
 
-	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "reset", "check"}) {
+	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "reset", "environment", "check"}) {
 		t.Fatalf("unexpected fan-out: %v", events)
 	}
 }
@@ -105,7 +107,7 @@ func TestNotifySupersedesInFlightRun(t *testing.T) {
 
 	// Two flushes: the superseded first run and the surviving last one. The two
 	// in between never get past their cancelled context.
-	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "flush", "reset", "check"}) {
+	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "flush", "reset", "environment", "check"}) {
 		t.Fatalf("unexpected fan-out: %v", events)
 	}
 }
@@ -133,7 +135,7 @@ func TestSupersededRunStopsBeforeReset(t *testing.T) {
 
 	// The first run reached flushCache but must not have reset the resolver
 	// afterwards, otherwise the stages would interleave as flush/reset/flush.
-	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "flush", "reset", "check"}) {
+	if events := r.snapshot(); !slices.Equal(events, []string{"flush", "flush", "reset", "environment", "check"}) {
 		t.Fatalf("unexpected fan-out: %v", events)
 	}
 }

@@ -1,0 +1,1466 @@
+From 124d99d6ca98e5c75467d4968e25a1aecae6b114 Mon Sep 17 00:00:00 2001
+From: mihomo EasyTier staging <staging@localhost>
+Date: Thu, 8 Oct 2026 00:17:05 +0800
+Subject: [PATCH 1/6] mihomo dynamic environment and management support
+
+---
+ easytier-core/src/connectivity/composite.rs   |  90 +++++-
+ .../src/connectivity/connector_host.rs        | 191 ++++++++++++-
+ easytier-core/src/connectivity/direct/mod.rs  |   4 +
+ .../src/connectivity/stun/collector.rs        | 265 ++++++++++++++----
+ easytier-core/src/instance/mod.rs             |   7 +
+ easytier-core/src/management/forwarded_rpc.rs |  13 +-
+ .../src/management/instance_rpc/full.rs       | 142 +++++++++-
+ easytier-core/src/management/mod.rs           |   9 +-
+ easytier-core/src/wasi/abi.rs                 |   4 +
+ easytier-core/src/wasi/runtime.rs             |  58 ++--
+ .../src/wasi/runtime/abi/web_client.rs        |   6 +-
+ easytier-core/src/wasi/schema.rs              |  59 ++++
+ easytier-core/src/wasi/web_client.rs          |   9 +-
+ 13 files changed, 755 insertions(+), 102 deletions(-)
+
+diff --git a/easytier-core/src/connectivity/composite.rs b/easytier-core/src/connectivity/composite.rs
+index 6eb3bfe..84014c0 100644
+--- a/easytier-core/src/connectivity/composite.rs
++++ b/easytier-core/src/connectivity/composite.rs
+@@ -36,6 +36,7 @@ struct CachedInterfaceAddrs {
+ 
+ struct InterfaceAddrCacheEntry {
+     context: SocketContext,
++    revision: u64,
+     value: Arc<tokio::sync::Mutex<Option<CachedInterfaceAddrs>>>,
+ }
+ 
+@@ -52,7 +53,12 @@ impl InterfaceAddrCache {
+         }
+     }
+ 
+-    async fn get_or_collect<F, Fut>(&self, context: &SocketContext, collect: F) -> GetIpListResponse
++    async fn get_or_collect<F, Fut>(
++        &self,
++        context: &SocketContext,
++        revision: u64,
++        collect: F,
++    ) -> GetIpListResponse
+     where
+         F: FnOnce() -> Fut,
+         Fut: Future<Output = GetIpListResponse>,
+@@ -63,18 +69,25 @@ impl InterfaceAddrCache {
+                 if Arc::strong_count(&entry.value) > 1 {
+                     return true;
+                 }
++                if entry.revision != revision {
++                    return false;
++                }
+                 entry.value.try_lock().map_or(true, |cached| {
+                     cached
+                         .as_ref()
+                         .is_some_and(|cached| cached.collected_at.elapsed() < self.ttl)
+                 })
+             });
+-            if let Some(entry) = entries.iter().find(|entry| &entry.context == context) {
++            if let Some(entry) = entries
++                .iter()
++                .find(|entry| &entry.context == context && entry.revision == revision)
++            {
+                 entry.value.clone()
+             } else {
+                 let value = Arc::new(tokio::sync::Mutex::new(None));
+                 entries.push(InterfaceAddrCacheEntry {
+                     context: context.clone(),
++                    revision,
+                     value: value.clone(),
+                 });
+                 value
+@@ -103,6 +116,10 @@ impl InterfaceAddrCache {
+ /// Mechanical connector operations supplied by one process-wide runtime.
+ #[async_trait]
+ pub trait ConnectorRuntime: VirtualTcpSocketFactory + Send + Sync + 'static {
++    fn environment_revision(&self) -> u64 {
++        0
++    }
++
+     fn supports_external_tunnel(&self, _scheme: &str) -> bool {
+         false
+     }
+@@ -167,9 +184,16 @@ where
+     S: ConnectorRuntime,
+ {
+     async fn cached_ip_addrs(&self, context: &SocketContext) -> GetIpListResponse {
+-        self.interface_addrs
+-            .get_or_collect(context, || self.sockets.collect_ip_addrs(context))
+-            .await
++        loop {
++            let revision = self.sockets.environment_revision();
++            let response = self
++                .interface_addrs
++                .get_or_collect(context, revision, || self.sockets.collect_ip_addrs(context))
++                .await;
++            if self.sockets.environment_revision() == revision {
++                return response;
++            }
++        }
+     }
+ }
+ 
+@@ -342,7 +366,7 @@ mod tests {
+             let calls = calls.clone();
+             async move {
+                 cache
+-                    .get_or_collect(&context, || async move {
++                    .get_or_collect(&context, 0, || async move {
+                         calls.fetch_add(1, Ordering::SeqCst);
+                         let _ = started_tx.send(());
+                         let _ = release_rx.await;
+@@ -361,7 +385,7 @@ mod tests {
+             async move {
+                 let _ = second_started_tx.send(());
+                 cache
+-                    .get_or_collect(&context, || async move {
++                    .get_or_collect(&context, 0, || async move {
+                         calls.fetch_add(1, Ordering::SeqCst);
+                         GetIpListResponse::default()
+                     })
+@@ -390,14 +414,14 @@ mod tests {
+ 
+         for context in &contexts {
+             cache
+-                .get_or_collect(context, || async {
++                .get_or_collect(context, 0, || async {
+                     calls.fetch_add(1, Ordering::SeqCst);
+                     GetIpListResponse::default()
+                 })
+                 .await;
+         }
+         cache
+-            .get_or_collect(&contexts[0], || async {
++            .get_or_collect(&contexts[0], 0, || async {
+                 calls.fetch_add(1, Ordering::SeqCst);
+                 GetIpListResponse::default()
+             })
+@@ -406,6 +430,42 @@ mod tests {
+         assert_eq!(calls.load(Ordering::SeqCst), contexts.len());
+     }
+ 
++    #[tokio::test]
++    async fn new_environment_revision_replaces_a_fresh_cache_entry() {
++        let cache = InterfaceAddrCache::new(Duration::from_secs(60));
++        let context = SocketContext::default();
++        let old = GetIpListResponse {
++            public_ipv4: Some(std::net::Ipv4Addr::new(198, 51, 100, 1).into()),
++            ..Default::default()
++        };
++        let new = GetIpListResponse {
++            public_ipv4: Some(std::net::Ipv4Addr::new(198, 51, 100, 2).into()),
++            ..Default::default()
++        };
++        assert_eq!(
++            cache
++                .get_or_collect(&context, 0, || async { old.clone() })
++                .await,
++            old
++        );
++        let revision = u64::from(u32::MAX) + 1;
++        assert_eq!(
++            cache
++                .get_or_collect(&context, revision, || async { new.clone() })
++                .await,
++            new
++        );
++        assert_eq!(
++            cache
++                .get_or_collect(&context, revision, || async {
++                    panic!("same environment revision must share the fresh entry")
++                })
++                .await,
++            new
++        );
++        assert_eq!(cache.entries.lock().await.len(), 1);
++    }
++
+     #[tokio::test]
+     async fn slow_collection_does_not_block_a_different_context() {
+         let cache = Arc::new(InterfaceAddrCache::new(Duration::from_secs(60)));
+@@ -417,7 +477,7 @@ mod tests {
+             let cache = cache.clone();
+             async move {
+                 cache
+-                    .get_or_collect(&slow_context, || async move {
++                    .get_or_collect(&slow_context, 0, || async move {
+                         let _ = started_tx.send(());
+                         let _ = release_rx.await;
+                         GetIpListResponse::default()
+@@ -429,7 +489,7 @@ mod tests {
+ 
+         tokio::time::timeout(
+             Duration::from_millis(100),
+-            cache.get_or_collect(&other_context, || async { GetIpListResponse::default() }),
++            cache.get_or_collect(&other_context, 0, || async { GetIpListResponse::default() }),
+         )
+         .await
+         .expect("different socket contexts must collect independently");
+@@ -444,7 +504,7 @@ mod tests {
+         let cached_context = SocketContext::default().with_socket_mark(Some(1));
+         let slow_context = SocketContext::default().with_socket_mark(Some(2));
+         cache
+-            .get_or_collect(&cached_context, || async { GetIpListResponse::default() })
++            .get_or_collect(&cached_context, 0, || async { GetIpListResponse::default() })
+             .await;
+ 
+         let (started_tx, started_rx) = oneshot::channel();
+@@ -453,7 +513,7 @@ mod tests {
+             let cache = cache.clone();
+             async move {
+                 cache
+-                    .get_or_collect(&slow_context, || async move {
++                    .get_or_collect(&slow_context, 0, || async move {
+                         let _ = started_tx.send(());
+                         let _ = release_rx.await;
+                         GetIpListResponse::default()
+@@ -465,7 +525,7 @@ mod tests {
+ 
+         tokio::time::timeout(
+             Duration::from_millis(100),
+-            cache.get_or_collect(&cached_context, || async {
++            cache.get_or_collect(&cached_context, 0, || async {
+                 panic!("fresh cache hit must not recollect")
+             }),
+         )
+@@ -484,7 +544,7 @@ mod tests {
+ 
+         for _ in 0..2 {
+             cache
+-                .get_or_collect(&context, || async {
++                .get_or_collect(&context, 0, || async {
+                     calls.fetch_add(1, Ordering::SeqCst);
+                     GetIpListResponse::default()
+                 })
+diff --git a/easytier-core/src/connectivity/connector_host.rs b/easytier-core/src/connectivity/connector_host.rs
+index c96e5e7..cfd1485 100644
+--- a/easytier-core/src/connectivity/connector_host.rs
++++ b/easytier-core/src/connectivity/connector_host.rs
+@@ -18,6 +18,7 @@ use std::{
+ };
+ 
+ use async_trait::async_trait;
++use parking_lot::RwLock;
+ use serde::{Deserialize, Serialize};
+ use url::Url;
+ 
+@@ -60,7 +61,69 @@ pub struct HostConnectorEnvironmentSnapshot {
+     pub preferred_ipv6_sources: Vec<PreferredIpv6Source>,
+ }
+ 
+-impl HostConnectorEnvironmentSnapshot {
++#[derive(Debug, Clone, Default)]
++struct HostConnectorEnvironmentDynamic {
++    public_ipv4: Option<Ipv4Addr>,
++    interface_ipv4s: Vec<Ipv4Addr>,
++    public_ipv6: Option<Ipv6Addr>,
++    interface_ipv6s: Vec<Ipv6Addr>,
++    local_ips: Vec<IpAddr>,
++    preferred_ipv6_sources: Vec<PreferredIpv6Source>,
++}
++
++impl From<&HostConnectorEnvironmentSnapshot> for HostConnectorEnvironmentDynamic {
++    fn from(snapshot: &HostConnectorEnvironmentSnapshot) -> Self {
++        Self {
++            public_ipv4: snapshot.public_ipv4,
++            interface_ipv4s: snapshot.interface_ipv4s.clone(),
++            public_ipv6: snapshot.public_ipv6,
++            interface_ipv6s: snapshot.interface_ipv6s.clone(),
++            local_ips: snapshot.local_ips.clone(),
++            preferred_ipv6_sources: snapshot.preferred_ipv6_sources.clone(),
++        }
++    }
++}
++
++#[derive(Debug, Default)]
++struct HostConnectorEnvironmentVersion {
++    initialized: bool,
++    revision: u64,
++    dynamic: HostConnectorEnvironmentDynamic,
++}
++
++/// Process-wide host facts shared by every static and Web-managed instance.
++/// Listener mappings and protected ports remain instance declarations.
++#[derive(Debug, Default)]
++pub struct HostConnectorEnvironmentState {
++    value: RwLock<HostConnectorEnvironmentVersion>,
++}
++
++impl HostConnectorEnvironmentState {
++    pub fn initialize(&self, snapshot: &HostConnectorEnvironmentSnapshot) {
++        let mut value = self.value.write();
++        if !value.initialized {
++            value.dynamic = snapshot.into();
++            value.initialized = true;
++        }
++    }
++
++    pub fn update(&self, revision: u64, snapshot: &HostConnectorEnvironmentSnapshot) -> bool {
++        let mut value = self.value.write();
++        if revision <= value.revision {
++            return false;
++        }
++        value.dynamic = snapshot.into();
++        value.revision = revision;
++        value.initialized = true;
++        true
++    }
++
++    pub fn revision(&self) -> u64 {
++        self.value.read().revision
++    }
++}
++
++impl HostConnectorEnvironmentDynamic {
+     fn ip_list(&self) -> GetIpListResponse {
+         GetIpListResponse {
+             public_ipv4: self.public_ipv4.map(Into::into),
+@@ -113,6 +176,7 @@ where
+     sockets: HostSocketFactory<B>,
+     listeners: HostTcpListenerFactory<B>,
+     environment: Arc<HostConnectorEnvironmentSnapshot>,
++    environment_state: Arc<HostConnectorEnvironmentState>,
+     environment_io: Arc<E>,
+     external_tunnel_connector: Option<Arc<dyn ExternalTunnelConnector>>,
+ }
+@@ -128,16 +192,25 @@ where
+         environment: HostConnectorEnvironmentSnapshot,
+         environment_io: Arc<E>,
+     ) -> Self {
++        let environment_state = Arc::new(HostConnectorEnvironmentState::default());
++        environment_state.initialize(&environment);
+         Self {
+             socket_runtime: runtime.clone(),
+             sockets: HostSocketFactory::new(runtime.clone(), backend.clone()),
+             listeners: HostTcpListenerFactory::new(runtime, backend),
+             environment: Arc::new(environment),
++            environment_state,
+             environment_io,
+             external_tunnel_connector: None,
+         }
+     }
+ 
++    pub fn with_environment_state(mut self, state: Arc<HostConnectorEnvironmentState>) -> Self {
++        state.initialize(&self.environment);
++        self.environment_state = state;
++        self
++    }
++
+     pub fn with_external_tunnel_connector(
+         mut self,
+         connector: Arc<dyn ExternalTunnelConnector>,
+@@ -192,6 +265,10 @@ where
+     B: ConnectorHostSocketBackend,
+     E: HostConnectorEnvironmentIo,
+ {
++    fn environment_revision(&self) -> u64 {
++        self.environment_state.revision()
++    }
++
+     fn supports_external_tunnel(&self, scheme: &str) -> bool {
+         self.external_tunnel_connector
+             .as_ref()
+@@ -233,7 +310,7 @@ where
+     }
+ 
+     async fn collect_ip_addrs(&self, _context: &SocketContext) -> GetIpListResponse {
+-        self.environment.ip_list()
++        self.environment_state.value.read().dynamic.ip_list()
+     }
+ 
+     async fn preferred_ipv6_source(
+@@ -241,7 +318,11 @@ where
+         ip: Ipv6Addr,
+         _context: SocketContext,
+     ) -> Option<PreferredIpv6Source> {
+-        self.environment.preferred_ipv6_source(ip)
++        self.environment_state
++            .value
++            .read()
++            .dynamic
++            .preferred_ipv6_source(ip)
+     }
+ }
+ 
+@@ -259,7 +340,12 @@ where
+     }
+ 
+     fn is_local_ip(&self, ip: &IpAddr) -> bool {
+-        self.environment.local_ips.contains(ip)
++        self.environment_state
++            .value
++            .read()
++            .dynamic
++            .local_ips
++            .contains(ip)
+     }
+ }
+ 
+@@ -779,19 +865,110 @@ mod tests {
+             snapshot
+         );
+         assert_eq!(
+-            snapshot.ip_list().interface_ipv4s,
++            HostConnectorEnvironmentDynamic::from(&snapshot)
++                .ip_list()
++                .interface_ipv4s,
+             vec![Ipv4Addr::new(192, 0, 2, 1).into()]
+         );
+         assert_eq!(
+-            snapshot.preferred_ipv6_source("2001:db8::2".parse().unwrap()),
++            HostConnectorEnvironmentDynamic::from(&snapshot)
++                .preferred_ipv6_source("2001:db8::2".parse().unwrap()),
+             Some(PreferredIpv6Source {
+                 ip: "2001:db8::2".parse().unwrap(),
+                 ifindex: 7,
+             })
+         );
+         assert_eq!(
+-            snapshot.preferred_ipv6_source("fd00::1".parse().unwrap()),
++            HostConnectorEnvironmentDynamic::from(&snapshot)
++                .preferred_ipv6_source("fd00::1".parse().unwrap()),
+             None
+         );
+     }
++
++    #[tokio::test]
++    async fn shared_environment_updates_existing_and_later_hosts_without_changing_declarations() {
++        let state = Arc::new(HostConnectorEnvironmentState::default());
++        let original = snapshot();
++        let make_runtime = || {
++            HostConnectorRuntime::new(
++                HostSocketRuntime::new(),
++                Arc::new(UnsupportedBackend::default()),
++                original.clone(),
++                Arc::new(TestEnvironmentIo::default()),
++            )
++            .with_environment_state(state.clone())
++        };
++        let first = Arc::new(make_runtime());
++        let host = ConnectorHostAdapter::new(first.clone(), first.clone());
++        let context = SocketContext::default();
++        let initial = DirectConnectorHost::collect_ip_addrs(&host, &context).await;
++        assert_eq!(
++            initial.interface_ipv4s,
++            vec![Ipv4Addr::new(192, 0, 2, 1).into()]
++        );
++
++        let replacement = HostConnectorEnvironmentSnapshot {
++            public_ipv4: Some("198.51.100.2".parse().unwrap()),
++            interface_ipv4s: vec!["192.0.2.2".parse().unwrap()],
++            public_ipv6: Some("2001:db8::3".parse().unwrap()),
++            interface_ipv6s: vec!["2001:db8::4".parse().unwrap()],
++            mapped_listeners: vec!["tcp://198.51.100.2:22020".parse().unwrap()],
++            local_ips: vec!["192.0.2.2".parse().unwrap()],
++            protected_tcp_ports: vec![22020],
++            preferred_ipv6_sources: vec![PreferredIpv6Source {
++                ip: "2001:db8::4".parse().unwrap(),
++                ifindex: 9,
++            }],
++        };
++        let revision = u64::from(u32::MAX) + 1;
++        assert!(state.update(revision, &replacement));
++        assert!(!state.update(revision, &original));
++        assert!(!state.update(revision - 1, &original));
++        let later = make_runtime();
++        assert_eq!(state.revision(), revision);
++        let updated = DirectConnectorHost::collect_ip_addrs(&host, &context).await;
++        assert_eq!(updated, later.collect_ip_addrs(&context).await);
++        assert_eq!(
++            updated,
++            HostConnectorEnvironmentDynamic::from(&replacement).ip_list()
++        );
++        assert!(!DirectConnectorHost::is_local_ip(
++            &host,
++            &"192.0.2.1".parse().unwrap()
++        ));
++        assert!(DirectConnectorHost::is_local_ip(
++            &host,
++            &"192.0.2.2".parse().unwrap()
++        ));
++        assert_eq!(
++            DirectConnectorHost::preferred_ipv6_source(
++                &host,
++                "2001:db8::4".parse().unwrap(),
++                context.clone()
++            )
++            .await,
++            replacement.preferred_ipv6_sources.first().copied()
++        );
++        assert_eq!(
++            DirectConnectorHost::preferred_ipv6_source(
++                &host,
++                "2001:db8::2".parse().unwrap(),
++                context
++            )
++            .await,
++            None
++        );
++        assert_eq!(
++            DirectConnectorHost::mapped_listeners(&host),
++            original.mapped_listeners
++        );
++        assert_eq!(
++            first.environment.protected_tcp_ports,
++            original.protected_tcp_ports
++        );
++        assert_eq!(
++            later.environment.protected_tcp_ports,
++            original.protected_tcp_ports
++        );
++    }
+ }
+diff --git a/easytier-core/src/connectivity/direct/mod.rs b/easytier-core/src/connectivity/direct/mod.rs
+index cf6269d..344ffa1 100644
+--- a/easytier-core/src/connectivity/direct/mod.rs
++++ b/easytier-core/src/connectivity/direct/mod.rs
+@@ -238,6 +238,10 @@ where
+         self.run_as_client();
+     }
+ 
++    pub(crate) fn notify_environment_changed(&self) {
++        self.data.stun.update_stun_info();
++    }
++
+     pub fn run_as_server(&self) {
+         self.data
+             .peer_manager
+diff --git a/easytier-core/src/connectivity/stun/collector.rs b/easytier-core/src/connectivity/stun/collector.rs
+index d9704c8..617b560 100644
+--- a/easytier-core/src/connectivity/stun/collector.rs
++++ b/easytier-core/src/connectivity/stun/collector.rs
+@@ -87,7 +87,7 @@ where
+     tcp_nat_test_result: Arc<RwLock<Option<StunNatTypeDetectResult>>>,
+     public_ipv6: Arc<RwLock<Option<Ipv6Addr>>>,
+     nat_test_result_time: Arc<RwLock<i64>>,
+-    redetect_notify: Arc<tokio::sync::Notify>,
++    redetect_revision: tokio::sync::watch::Sender<u64>,
+     tasks: Mutex<JoinSet<()>>,
+     started: AtomicBool,
+ }
+@@ -137,7 +137,7 @@ where
+             tcp_nat_test_result: Arc::new(RwLock::new(None)),
+             public_ipv6: Arc::new(RwLock::new(None)),
+             nat_test_result_time: Arc::new(RwLock::new(unix_timestamp())),
+-            redetect_notify: Arc::new(tokio::sync::Notify::new()),
++            redetect_revision: tokio::sync::watch::channel(0).0,
+             tasks: Mutex::new(JoinSet::new()),
+             started: AtomicBool::new(false),
+         }
+@@ -243,9 +243,10 @@ where
+         let stun_servers = self.stun_servers.clone();
+         let udp_nat_test_result = self.udp_nat_test_result.clone();
+         let nat_test_time = self.nat_test_result_time.clone();
+-        let redetect_notify = self.redetect_notify.clone();
++        let mut redetect = self.redetect_revision.subscribe();
+         self.tasks.lock().unwrap().spawn(async move {
+             loop {
++                let revision = *redetect.borrow_and_update();
+                 let servers = sampled_servers(&stun_servers.read().unwrap());
+                 let detector = UdpNatTypeDetector::new(
+                     runtime.clone(),
+@@ -254,40 +255,55 @@ where
+                     servers,
+                     1,
+                 );
+-                let mut result = detector.detect_nat_type(0).await;
+-                tracing::debug!(?result, "finish udp nat type detect");
+-
+-                let nat_type = result
+-                    .as_ref()
+-                    .map(StunNatTypeDetectResult::nat_type)
+-                    .unwrap_or(NatType::Unknown);
+-                if nat_type == NatType::Symmetric {
+-                    let old_result = result.as_mut().unwrap();
+-                    tracing::debug!(?old_result, "start get extra bind result");
+-                    for server in old_result.collect_available_stun_server() {
+-                        let extra = detector.get_extra_bind_result(0, server).await;
+-                        tracing::debug!(?extra, "finish udp nat type detect with another port");
+-                        if let Ok(response) = extra {
+-                            old_result.extra_bind_test = Some(response);
+-                            break;
++                let detection = async {
++                    let mut result = detector.detect_nat_type(0).await;
++                    tracing::debug!(?result, "finish udp nat type detect");
++                    let nat_type = result
++                        .as_ref()
++                        .map(StunNatTypeDetectResult::nat_type)
++                        .unwrap_or(NatType::Unknown);
++                    if nat_type == NatType::Symmetric {
++                        let old_result = result.as_mut().unwrap();
++                        tracing::debug!(?old_result, "start get extra bind result");
++                        for server in old_result.collect_available_stun_server() {
++                            let extra = detector.get_extra_bind_result(0, server).await;
++                            tracing::debug!(?extra, "finish udp nat type detect with another port");
++                            if let Ok(response) = extra {
++                                old_result.extra_bind_test = Some(response);
++                                break;
++                            }
+                         }
+                     }
+-                }
++                    (result, nat_type)
++                };
++                let (result, nat_type) = tokio::select! {
++                    biased;
++                    _ = redetect.changed() => continue,
++                    result = detection => result,
++                };
+ 
+                 let mut sleep_sec = 10;
+-                if let Ok(result) = result {
+-                    *nat_test_time.write().unwrap() = unix_timestamp();
+-                    let completed_extra_test = result.extra_bind_test.is_some();
+-                    *udp_nat_test_result.write().unwrap() = Some(result);
+-                    if nat_type != NatType::Unknown
+-                        && (nat_type != NatType::Symmetric || completed_extra_test)
+-                    {
+-                        sleep_sec = 600;
++                {
++                    // Keep publication ordered against invalidation, including
++                    // native runtimes that can update from another thread.
++                    let current = redetect.borrow();
++                    if *current != revision {
++                        continue;
++                    }
++                    if let Ok(result) = result {
++                        *nat_test_time.write().unwrap() = unix_timestamp();
++                        let completed_extra_test = result.extra_bind_test.is_some();
++                        *udp_nat_test_result.write().unwrap() = Some(result);
++                        if nat_type != NatType::Unknown
++                            && (nat_type != NatType::Symmetric || completed_extra_test)
++                        {
++                            sleep_sec = 600;
++                        }
+                     }
+                 }
+ 
+                 tokio::select! {
+-                    _ = redetect_notify.notified() => {}
++                    _ = redetect.changed() => {}
+                     _ = crate::foundation::time::sleep(Duration::from_secs(sleep_sec)) => {}
+                 }
+             }
+@@ -299,9 +315,10 @@ where
+         let tcp_stun_servers = self.tcp_stun_servers.clone();
+         let tcp_nat_test_result = self.tcp_nat_test_result.clone();
+         let nat_test_time = self.nat_test_result_time.clone();
+-        let redetect_notify = self.redetect_notify.clone();
++        let mut redetect = self.redetect_revision.subscribe();
+         self.tasks.lock().unwrap().spawn(async move {
+             loop {
++                let revision = *redetect.borrow_and_update();
+                 let servers = sampled_servers(&tcp_stun_servers.read().unwrap());
+                 let detector = TcpNatTypeDetector::new(
+                     runtime.clone(),
+@@ -310,21 +327,31 @@ where
+                     servers,
+                     1,
+                 );
+-                let result = detector.detect_nat_type(0).await;
++                let result = tokio::select! {
++                    biased;
++                    _ = redetect.changed() => continue,
++                    result = detector.detect_nat_type(0) => result,
++                };
+                 tracing::debug!(?result, "finish tcp nat type detect");
+ 
+                 let mut sleep_sec = 10;
+-                if let Ok(result) = result {
+-                    *nat_test_time.write().unwrap() = unix_timestamp();
+-                    let nat_type = result.nat_type();
+-                    *tcp_nat_test_result.write().unwrap() = Some(result);
+-                    if nat_type != NatType::Unknown {
+-                        sleep_sec = 600;
++                {
++                    let current = redetect.borrow();
++                    if *current != revision {
++                        continue;
++                    }
++                    if let Ok(result) = result {
++                        *nat_test_time.write().unwrap() = unix_timestamp();
++                        let nat_type = result.nat_type();
++                        *tcp_nat_test_result.write().unwrap() = Some(result);
++                        if nat_type != NatType::Unknown {
++                            sleep_sec = 600;
++                        }
+                     }
+                 }
+ 
+                 tokio::select! {
+-                    _ = redetect_notify.notified() => {}
++                    _ = redetect.changed() => {}
+                     _ = crate::foundation::time::sleep(Duration::from_secs(sleep_sec)) => {}
+                 }
+             }
+@@ -335,19 +362,28 @@ where
+         let socket_context = self.udp_socket_context.clone();
+         let stun_servers_v6 = self.stun_servers_v6.clone();
+         let public_ipv6 = self.public_ipv6.clone();
+-        let redetect_notify = self.redetect_notify.clone();
++        let mut redetect = self.redetect_revision.subscribe();
+         self.tasks.lock().unwrap().spawn(async move {
+             loop {
++                let revision = *redetect.borrow_and_update();
+                 let servers = stun_servers_v6.read().unwrap().clone();
+-                if let Some(ip) = Self::get_public_ipv6(
++                let detection = Self::get_public_ipv6(
+                     runtime.clone(),
+                     dns.clone(),
+                     socket_context.clone(),
+                     &servers,
+-                )
+-                .await
++                );
++                let result = tokio::select! {
++                    biased;
++                    _ = redetect.changed() => continue,
++                    result = detection => result,
++                };
+                 {
+-                    *public_ipv6.write().unwrap() = Some(ip);
++                    let current = redetect.borrow();
++                    if *current != revision {
++                        continue;
++                    }
++                    *public_ipv6.write().unwrap() = result;
+                 }
+ 
+                 let sleep_sec = if public_ipv6.read().unwrap().is_none() {
+@@ -356,7 +392,7 @@ where
+                     360
+                 };
+                 tokio::select! {
+-                    _ = redetect_notify.notified() => {}
++                    _ = redetect.changed() => {}
+                     _ = crate::foundation::time::sleep(Duration::from_secs(sleep_sec)) => {}
+                 }
+             }
+@@ -473,7 +509,13 @@ where
+     }
+ 
+     fn update_stun_info(&self) {
+-        self.redetect_notify.notify_waiters();
++        self.redetect_revision.send_modify(|revision| {
++            *self.udp_nat_test_result.write().unwrap() = None;
++            *self.tcp_nat_test_result.write().unwrap() = None;
++            *self.public_ipv6.write().unwrap() = None;
++            *self.nat_test_result_time.write().unwrap() = 0;
++            *revision += 1;
++        });
+     }
+ }
+ 
+@@ -553,7 +595,7 @@ mod tests {
+     };
+ 
+     use bytecodec::{DecodeExt as _, EncodeExt as _};
+-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
++    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+ 
+     use crate::host::dns::{DnsQuery, DnsRecordResolver, DnsResolver, DnsSrvRecord};
+     use crate::socket::{
+@@ -656,6 +698,9 @@ mod tests {
+     #[derive(Default)]
+     struct MockRuntime {
+         udp_binds: Mutex<Vec<UdpBindOptions>>,
++        tcp_connects: std::sync::atomic::AtomicUsize,
++        generation: std::sync::atomic::AtomicUsize,
++        stall_probes: AtomicBool,
+     }
+ 
+     #[async_trait]
+@@ -663,10 +708,32 @@ mod tests {
+         type Socket = MockUdpSocket;
+ 
+         async fn bind_udp(&self, options: UdpBindOptions) -> anyhow::Result<Arc<Self::Socket>> {
++            let ipv6 = options.context.ip_version == IpVersion::V6;
+             self.udp_binds.lock().unwrap().push(options);
++            if self.stall_probes.load(Ordering::SeqCst) {
++                std::future::pending::<()>().await;
++            }
++            let generation = self.generation.load(Ordering::SeqCst);
++            let (local_addr, mapped_addr) = if ipv6 {
++                (
++                    "[::]:40000".parse().unwrap(),
++                    SocketAddr::new(
++                        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10 + generation as u16).into(),
++                        40123,
++                    ),
++                )
++            } else {
++                (
++                    "0.0.0.0:40000".parse().unwrap(),
++                    SocketAddr::new(
++                        Ipv4Addr::new(198, 51, 100, 10 + generation as u8).into(),
++                        40123,
++                    ),
++                )
++            };
+             Ok(Arc::new(MockUdpSocket {
+-                local_addr: "0.0.0.0:40000".parse().unwrap(),
+-                mapped_addr: "198.51.100.10:40123".parse().unwrap(),
++                local_addr,
++                mapped_addr,
+                 responses: Mutex::new(VecDeque::new()),
+                 response_ready: tokio::sync::Notify::new(),
+             }))
+@@ -678,7 +745,36 @@ mod tests {
+         type Socket = MockTcpSocket;
+ 
+         async fn connect_tcp(&self, _options: TcpConnectOptions) -> anyhow::Result<Self::Socket> {
+-            anyhow::bail!("TCP is not used by this test")
++            self.tcp_connects.fetch_add(1, Ordering::SeqCst);
++            if self.stall_probes.load(Ordering::SeqCst) {
++                std::future::pending::<()>().await;
++            }
++            let generation = self.generation.load(Ordering::SeqCst);
++            let (client, mut server) = tokio::io::duplex(256);
++            tokio::spawn(async move {
++                let mut header = [0; 20];
++                server.read_exact(&mut header).await.unwrap();
++                let request = MessageDecoder::<Attribute>::new()
++                    .decode_from_bytes(&header)
++                    .unwrap()
++                    .unwrap();
++                let mut response = Message::<Attribute>::new(
++                    MessageClass::SuccessResponse,
++                    BINDING,
++                    request.transaction_id(),
++                );
++                response.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(
++                    SocketAddr::new(
++                        Ipv4Addr::new(198, 51, 100, 10 + generation as u8).into(),
++                        40123,
++                    ),
++                )));
++                let bytes = MessageEncoder::new()
++                    .encode_into_bytes(response)
++                    .unwrap();
++                server.write_all(&bytes).await.unwrap();
++            });
++            Ok(MockTcpSocket(client))
+         }
+     }
+ 
+@@ -765,4 +861,75 @@ mod tests {
+             Some("instance-a")
+         );
+     }
++
++    #[tokio::test]
++    async fn environment_change_invalidates_observations_and_interrupts_all_stun_probes() {
++        let runtime = Arc::new(MockRuntime::default());
++        let servers = vec!["192.0.2.1:3478".to_owned(), "192.0.2.2:3478".to_owned()];
++        let collector = StunInfoCollector::new(
++            runtime.clone(),
++            Arc::new(MockDns),
++            SocketContext::default(),
++            servers.clone(),
++            servers,
++            vec!["[2001:db8::ff]:3478".to_owned()],
++        );
++        collector.get_stun_info();
++        tokio::time::timeout(Duration::from_secs(2), async {
++            loop {
++                let info = collector.get_stun_info();
++                if collector.udp_nat_test_result.read().unwrap().is_some()
++                    && collector.tcp_nat_test_result.read().unwrap().is_some()
++                    && collector.public_ipv6.read().unwrap().is_some()
++                {
++                    assert_eq!(info.public_ip, vec!["198.51.100.10", "2001:db8::a"]);
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("initial UDP, TCP and IPv6 detection must complete");
++
++        let previous_udp = runtime.udp_binds.lock().unwrap().len();
++        let previous_tcp = runtime.tcp_connects.load(Ordering::SeqCst);
++        runtime.stall_probes.store(true, Ordering::SeqCst);
++        runtime.generation.store(1, Ordering::SeqCst);
++        collector.update_stun_info();
++        let invalidated = collector.get_stun_info();
++        assert!(invalidated.public_ip.is_empty());
++        assert_eq!(invalidated.udp_nat_type, NatType::Unknown as i32);
++        assert_eq!(invalidated.tcp_nat_type, NatType::Unknown as i32);
++        tokio::time::timeout(Duration::from_secs(2), async {
++            loop {
++                if runtime.udp_binds.lock().unwrap().len() >= previous_udp + 2
++                    && runtime.tcp_connects.load(Ordering::SeqCst) > previous_tcp
++                {
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("environment change must wake sleeping UDP, TCP and IPv6 routines");
++
++        runtime.generation.store(2, Ordering::SeqCst);
++        runtime.stall_probes.store(false, Ordering::SeqCst);
++        collector.update_stun_info();
++        tokio::time::timeout(Duration::from_secs(2), async {
++            loop {
++                let info = collector.get_stun_info();
++                if collector.udp_nat_test_result.read().unwrap().is_some()
++                    && collector.tcp_nat_test_result.read().unwrap().is_some()
++                    && collector.public_ipv6.read().unwrap().is_some()
++                {
++                    assert_eq!(info.public_ip, vec!["198.51.100.12", "2001:db8::c"]);
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("update during detection must cancel old probes and run the newest revision");
++    }
+ }
+diff --git a/easytier-core/src/instance/mod.rs b/easytier-core/src/instance/mod.rs
+index 00b299a..104b116 100644
+--- a/easytier-core/src/instance/mod.rs
++++ b/easytier-core/src/instance/mod.rs
+@@ -898,6 +898,13 @@ where
+         CoreInstanceState::from_u8(self.state.load(Ordering::Acquire))
+     }
+ 
++    /// Refreshes existing NAT observations after the Host publishes new facts.
++    pub fn notify_environment_changed(&self) {
++        if let Some(direct) = &self.direct {
++            direct.notify_environment_changed();
++        }
++    }
++
+     /// Returns the peer manager for tunnels accepted outside this instance's
+     /// regular listener path, such as the shared Web listener.
+     pub fn peer_manager(&self) -> &Arc<PeerManagerCore> {
+diff --git a/easytier-core/src/management/forwarded_rpc.rs b/easytier-core/src/management/forwarded_rpc.rs
+index cd3c5bc..fbee921 100644
+--- a/easytier-core/src/management/forwarded_rpc.rs
++++ b/easytier-core/src/management/forwarded_rpc.rs
+@@ -7,7 +7,10 @@ use crate::{
+     proto::{
+         api::{
+             config::ConfigRpcDescriptor,
+-            instance::{ConnectorManageRpcDescriptor, PeerManageRpcDescriptor},
++            instance::{
++                ConnectorManageRpcDescriptor, CredentialManageRpcDescriptor,
++                PeerManageRpcDescriptor,
++            },
+         },
+         rpc_types::{
+             controller::BaseController,
+@@ -92,6 +95,10 @@ pub(crate) fn register_forwarded_instance_management_rpc<F>(
+         ForwardedManagementHandler::<F, ConnectorManageRpcDescriptor>::new(forwarder.clone()),
+         "",
+     );
++    registry.register(
++        ForwardedManagementHandler::<F, CredentialManageRpcDescriptor>::new(forwarder.clone()),
++        "",
++    );
+     registry.register(
+         ForwardedManagementHandler::<F, ConfigRpcDescriptor>::new(forwarder),
+         "",
+@@ -130,6 +137,10 @@ mod tests {
+             "api.instance.PeerManageRpc.ListPeer",
+             "api.instance.ConnectorManageRpc.ListConnector",
+             "api.config.ConfigRpc.GetConfig",
++            "api.instance.CredentialManageRpc.GenerateCredential",
++            "api.instance.CredentialManageRpc.UpsertCredential",
++            "api.instance.CredentialManageRpc.RevokeCredential",
++            "api.instance.CredentialManageRpc.ListCredentials",
+         ];
+         for (index, full_method_name) in methods.into_iter().enumerate() {
+             let descriptor = registry
+diff --git a/easytier-core/src/management/instance_rpc/full.rs b/easytier-core/src/management/instance_rpc/full.rs
+index 7b698e5..4431e76 100644
+--- a/easytier-core/src/management/instance_rpc/full.rs
++++ b/easytier-core/src/management/instance_rpc/full.rs
+@@ -37,7 +37,7 @@ use crate::{
+     },
+ };
+ 
+-use super::InstanceManagementRpc;
++use super::{InstanceManagementRpc, ReadOnlyInstanceResolver, ResolvedInstanceManagementRpc};
+ use crate::management::{full::packet_proxy, resolve_instance};
+ 
+ /// Dispatches the JSON form of an Instance-targeted management RPC without
+@@ -312,10 +312,9 @@ where
+ }
+ 
+ #[async_trait::async_trait]
+-impl<F, H> CredentialManageRpc for InstanceManagementRpc<F>
++impl<R> CredentialManageRpc for ResolvedInstanceManagementRpc<R>
+ where
+-    F: InstanceFactory<Instance = CoreInstance<H>>,
+-    H: CoreInstanceHost,
++    R: ReadOnlyInstanceResolver,
+ {
+     type Controller = BaseController;
+ 
+@@ -432,7 +431,140 @@ mod tests {
+     use std::net::Ipv4Addr;
+ 
+     use super::*;
+-    use crate::gateway::vpn_portal::PortalClientInfoSnapshot;
++    use crate::{
++        config::toml::{NetworkIdentity, TomlConfig},
++        gateway::vpn_portal::PortalClientInfoSnapshot,
++        host::testkit::{TestDns, TestHost},
++        instance::CoreHostAdapters,
++        process_runtime::CoreProcessRuntime,
++    };
++    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
++
++    #[derive(Clone)]
++    struct CredentialTestResolver(Arc<CoreInstance<TestHost>>);
++
++    impl ReadOnlyInstanceResolver for CredentialTestResolver {
++        type Host = TestHost;
++
++        fn resolve(
++            &self,
++            identifier: Option<&easytier_proto::api::instance::InstanceIdentifier>,
++        ) -> rpc_types::error::Result<Arc<CoreInstance<TestHost>>> {
++            super::super::validate_bound_identifier(
++                identifier,
++                self.0.instance_id(),
++                self.0.instance_name(),
++            )?;
++            Ok(self.0.clone())
++        }
++    }
++
++    fn credential_rpc(
++        network_secret: Option<&str>,
++    ) -> ResolvedInstanceManagementRpc<CredentialTestResolver> {
++        let config = TomlConfig::default();
++        config.set_network_identity(NetworkIdentity {
++            network_name: "credential-rpc".to_owned(),
++            network_secret: network_secret.map(str::to_owned),
++            network_secret_digest: None,
++        });
++        if network_secret.is_none() {
++            let private_key = x25519_dalek::StaticSecret::from([7_u8; 32]);
++            let public_key = x25519_dalek::PublicKey::from(&private_key);
++            config.set_secure_mode(Some(crate::proto::common::SecureModeConfig {
++                enabled: true,
++                local_private_key: Some(BASE64_STANDARD.encode(private_key.to_bytes())),
++                local_public_key: Some(BASE64_STANDARD.encode(public_key.as_bytes())),
++            }));
++        }
++        let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
++        let instance = CoreInstance::from_toml(
++            config,
++            CoreHostAdapters::new(
++                Arc::new(TestHost::default()),
++                Arc::new(TestDns),
++                Arc::new(packet_sink),
++                CoreProcessRuntime::new(),
++            ),
++        )
++        .unwrap();
++        ResolvedInstanceManagementRpc {
++            resolver: CredentialTestResolver(instance),
++            config_patch_persistence: None,
++        }
++    }
++
++    #[tokio::test]
++    async fn credential_rpc_supports_memory_storage_and_preserves_admin_permission() {
++        let rpc = credential_rpc(Some("admin-secret"));
++        let generated = rpc
++            .generate_credential(
++                BaseController::default(),
++                GenerateCredentialRequest {
++                    credential_id: Some("memory".to_owned()),
++                    groups: vec!["ops".to_owned()],
++                    ttl_seconds: 3600,
++                    reusable: Some(false),
++                    ..Default::default()
++                },
++            )
++            .await
++            .unwrap();
++        assert_eq!(generated.credential_id, "memory");
++        assert!(!generated.credential_secret.is_empty());
++        let updated = rpc
++            .upsert_credential(
++                BaseController::default(),
++                UpsertCredentialRequest {
++                    credential_id: generated.credential_id.clone(),
++                    credential_secret: generated.credential_secret,
++                    groups: vec!["updated".to_owned()],
++                    expiry_unix: generated.expiry_unix,
++                    reusable: Some(true),
++                    ..Default::default()
++                },
++            )
++            .await
++            .unwrap();
++        assert!(updated.changed);
++        let listed = rpc
++            .list_credentials(BaseController::default(), ListCredentialsRequest::default())
++            .await
++            .unwrap();
++        assert_eq!(listed.credentials.len(), 1);
++        assert_eq!(listed.credentials[0].groups, vec!["updated"]);
++        assert_eq!(listed.credentials[0].reusable, Some(true));
++        let revoked = rpc
++            .revoke_credential(
++                BaseController::default(),
++                RevokeCredentialRequest {
++                    credential_id: generated.credential_id,
++                    ..Default::default()
++                },
++            )
++            .await
++            .unwrap();
++        assert!(revoked.success);
++        assert!(
++            rpc.list_credentials(BaseController::default(), ListCredentialsRequest::default())
++                .await
++                .unwrap()
++                .credentials
++                .is_empty()
++        );
++
++        let error = credential_rpc(None)
++            .generate_credential(
++                BaseController::default(),
++                GenerateCredentialRequest {
++                    ttl_seconds: 3600,
++                    ..Default::default()
++                },
++            )
++            .await
++            .unwrap_err();
++        assert!(error.to_string().contains("only admin nodes"));
++    }
+ 
+     #[test]
+     #[allow(deprecated)]
+diff --git a/easytier-core/src/management/mod.rs b/easytier-core/src/management/mod.rs
+index 9f948d4..dd2c609 100644
+--- a/easytier-core/src/management/mod.rs
++++ b/easytier-core/src/management/mod.rs
+@@ -15,9 +15,9 @@ use crate::{
+     instance::{CoreInstance, CoreInstanceHost, manager::InstanceFactory},
+     rpc::service_registry::ServiceRegistry,
+ };
+-#[cfg(all(feature = "management", target_os = "wasi"))]
+-use easytier_proto::api::config::ConfigRpcServer;
+ use easytier_proto::api::instance::{ConnectorManageRpcServer, PeerManageRpcServer};
++#[cfg(all(feature = "management", target_os = "wasi"))]
++use easytier_proto::api::{config::ConfigRpcServer, instance::CredentialManageRpcServer};
+ 
+ pub use crate::instance::manager::{
+     ConfigFileControl, ConfigFilePermission, DaemonGuard, InstanceManager, ProcessRuntimeProvider,
+@@ -78,5 +78,8 @@ pub(crate) fn register_bound_management_rpc<H>(
+     registry.register(PeerManageRpcServer::new(rpc.clone()), "");
+     registry.register(ConnectorManageRpcServer::new(rpc.clone()), "");
+     #[cfg(feature = "management")]
+-    registry.register(ConfigRpcServer::new(rpc), "");
++    {
++        registry.register(ConfigRpcServer::new(rpc.clone()), "");
++        registry.register(CredentialManageRpcServer::new(rpc), "");
++    }
+ }
+diff --git a/easytier-core/src/wasi/abi.rs b/easytier-core/src/wasi/abi.rs
+index 16d3e10..4013317 100644
+--- a/easytier-core/src/wasi/abi.rs
++++ b/easytier-core/src/wasi/abi.rs
+@@ -29,6 +29,9 @@ pub const HOST_CRYPTO_AUTH_FAILED: i32 = -10;
+ /// Version of the JSON document accepted by `easytier_instance_create`.
+ pub const CORE_INSTANCE_CONFIG_VERSION: u32 = 14;
+ 
++/// Version of process-level dynamic host environment updates.
++pub const ENVIRONMENT_UPDATE_VERSION: u32 = 1;
++
+ /// Version of the JSON document accepted by `easytier_web_client_create`.
+ #[cfg(feature = "management")]
+ pub const WEB_CLIENT_CONFIG_VERSION: u32 = 1;
+@@ -70,6 +73,7 @@ pub const GUEST_EXPORTS: &[&str] = &[
+     // Guest-memory buffers.
+     "easytier_buffer_alloc",
+     "easytier_buffer_free",
++    "easytier_environment_update",
+     // Instance lifecycle and external runtime driving.
+     "easytier_instance_create",
+     "easytier_instance_start",
+diff --git a/easytier-core/src/wasi/runtime.rs b/easytier-core/src/wasi/runtime.rs
+index 6adc3cf..9867560 100644
+--- a/easytier-core/src/wasi/runtime.rs
++++ b/easytier-core/src/wasi/runtime.rs
+@@ -2,7 +2,7 @@
+ 
+ use crate::{
+     config::toml::TomlConfig,
+-    connectivity::connector_host::HostConnectorEnvironmentSnapshot,
++    connectivity::connector_host::{HostConnectorEnvironmentSnapshot, HostConnectorEnvironmentState},
+     gateway::dhcp::{DhcpIpv4ApplyOutcome, DhcpIpv4Host},
+     instance::{CorePacketPlane, InstanceRuntimeHost},
+ };
+@@ -88,6 +88,7 @@ pub(super) fn new_wasi_core_runtime(
+     config: TomlConfig,
+     process_runtime: std::sync::Arc<crate::process_runtime::CoreProcessRuntime>,
+     environment_snapshot: HostConnectorEnvironmentSnapshot,
++    environment_state: std::sync::Arc<HostConnectorEnvironmentState>,
+     packet_sink: crate::host::packet::HostPacketSinkHandle,
+     event_sink: u64,
+ ) -> anyhow::Result<WasiCoreRuntime> {
+@@ -103,10 +104,9 @@ pub(super) fn new_wasi_core_runtime(
+         },
+     };
+ 
+-    #[cfg(not(feature = "wasm-host-tunnel-outbound"))]
+-    use crate::connectivity::connector_host::new_connector_host;
+-    #[cfg(feature = "wasm-host-tunnel-outbound")]
+-    use crate::connectivity::connector_host::new_connector_host_with_external_tunnel;
++    use crate::connectivity::{
++        composite::ConnectorHostAdapter, connector_host::HostConnectorRuntime,
++    };
+ 
+     let socket_runtime = HostSocketRuntime::new();
+     let socket_backend = Arc::new(WasiHostSocketBackend::default());
+@@ -115,25 +115,22 @@ pub(super) fn new_wasi_core_runtime(
+     let host_tunnel_schemes: Arc<[String]> = Arc::from(["ws".to_owned(), "wss".to_owned()]);
+     #[cfg(feature = "wasm-host-tunnel-outbound")]
+     let tunnel_io = Arc::new(crate::wasi::adapter::tunnel::WasiHostTunnelIo::default());
+-    #[cfg(feature = "wasm-host-tunnel-outbound")]
+-    let host = Arc::new(new_connector_host_with_external_tunnel(
++    let connector_runtime = HostConnectorRuntime::new(
+         socket_runtime.clone(),
+         socket_backend,
+         environment_snapshot,
+         environment_io,
++    ).with_environment_state(environment_state);
++    #[cfg(feature = "wasm-host-tunnel-outbound")]
++    let connector_runtime = connector_runtime.with_external_tunnel_connector(
+         Arc::new(crate::wasi::adapter::tunnel::WasiHostTunnelConnector::new(
+             socket_runtime.clone(),
+             tunnel_io,
+             host_tunnel_schemes.clone(),
+         )),
+-    ));
+-    #[cfg(not(feature = "wasm-host-tunnel-outbound"))]
+-    let host = Arc::new(new_connector_host(
+-        socket_runtime.clone(),
+-        socket_backend,
+-        environment_snapshot,
+-        environment_io,
+-    ));
++    );
++    let connector_runtime = Arc::new(connector_runtime);
++    let host = Arc::new(ConnectorHostAdapter::new(connector_runtime.clone(), connector_runtime));
+     let dns = Arc::new(HostDnsResolver::new(
+         socket_runtime.clone(),
+         Arc::new(WasiHostDnsIo),
+@@ -211,7 +208,8 @@ mod abi {
+     };
+ 
+     use super::{WasiCoreRuntime, new_wasi_core_runtime};
+-    use crate::wasi::schema::WasiCoreInstanceCreateConfig;
++    use crate::wasi::schema::{WasiCoreInstanceCreateConfig, WasiEnvironmentUpdate};
++    use crate::connectivity::connector_host::HostConnectorEnvironmentState;
+     #[cfg(feature = "wasm-host-tunnel")]
+     use crate::wasi::schema::WasiHostTunnelMetadata;
+ 
+@@ -273,6 +271,7 @@ mod abi {
+         fn default() -> Self {
+             let factory = WasiInstanceFactory {
+                 process_runtime: CoreProcessRuntime::new(),
++                environment: Arc::new(HostConnectorEnvironmentState::default()),
+             };
+             Self {
+                 factory,
+@@ -290,6 +289,7 @@ mod abi {
+ 
+     struct WasiInstanceFactory {
+         process_runtime: std::sync::Arc<CoreProcessRuntime>,
++        environment: Arc<HostConnectorEnvironmentState>,
+     }
+ 
+     struct WasiCreateContext {
+@@ -354,6 +354,7 @@ mod abi {
+                     config,
+                     self.process_runtime.clone(),
+                     context.environment,
++                    self.environment.clone(),
+                     context.packet_sink,
+                     context.event_sink,
+                 )?
+@@ -728,6 +729,31 @@ mod abi {
+         })
+     }
+ 
++    #[unsafe(no_mangle)]
++    pub extern "C" fn easytier_environment_update(pointer: u32, length: u32) -> i32 {
++        let update = read_guest_buffer(pointer, length, MAX_CREATE_CONFIG_LEN)
++            .and_then(|encoded| Ok(serde_json::from_slice::<WasiEnvironmentUpdate>(&encoded)?))
++            .and_then(|update| {
++                update.validate()?;
++                Ok(update)
++            });
++        let update = match update {
++            Ok(update) => update,
++            Err(error) => {
++                set_abi_error(error);
++                return INVALID_INPUT;
++            }
++        };
++        CONTEXT.with(|context| {
++            if context.factory.environment.update(update.revision, &update.environment) {
++                for instance in context.instances.borrow().values() {
++                    instance.core.core().notify_environment_changed();
++                }
++            }
++        });
++        0
++    }
++
+     #[unsafe(no_mangle)]
+     /// Creates one core instance from a versioned envelope containing TOML.
+     ///
+diff --git a/easytier-core/src/wasi/runtime/abi/web_client.rs b/easytier-core/src/wasi/runtime/abi/web_client.rs
+index 157d943..43f3c33 100644
+--- a/easytier-core/src/wasi/runtime/abi/web_client.rs
++++ b/easytier-core/src/wasi/runtime/abi/web_client.rs
+@@ -48,13 +48,13 @@ pub extern "C" fn easytier_web_client_create(config_pointer: u32, config_length:
+         if context.web_client.borrow().is_some() {
+             return None;
+         }
+-        Some(context.factory.process_runtime.clone())
++        Some((context.factory.process_runtime.clone(), context.factory.environment.clone()))
+     });
+-    let Some(process_runtime) = process_runtime else {
++    let Some((process_runtime, environment_state)) = process_runtime else {
+         set_abi_error("WebClient is already running");
+         return INVALID_STATE;
+     };
+-    let web_client = match WasiWebClientRuntime::new(config, process_runtime) {
++    let web_client = match WasiWebClientRuntime::new(config, process_runtime, environment_state) {
+         Ok(web_client) => web_client,
+         Err(error) => {
+             set_abi_error(error);
+diff --git a/easytier-core/src/wasi/schema.rs b/easytier-core/src/wasi/schema.rs
+index 090dec8..3f40d2b 100644
+--- a/easytier-core/src/wasi/schema.rs
++++ b/easytier-core/src/wasi/schema.rs
+@@ -35,6 +35,31 @@ impl WasiCoreInstanceCreateConfig {
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub(crate) struct WasiEnvironmentUpdate {
++    pub version: u32,
++    pub revision: u64,
++    pub environment: HostConnectorEnvironmentSnapshot,
++}
++
++impl WasiEnvironmentUpdate {
++    pub fn validate(&self) -> anyhow::Result<()> {
++        if self.version != crate::wasi::abi::ENVIRONMENT_UPDATE_VERSION {
++            anyhow::bail!("unsupported host environment update version: {}", self.version);
++        }
++        if self.revision == 0 {
++            anyhow::bail!("host environment update revision must be non-zero");
++        }
++        if self.environment.public_ipv6.is_some_and(|ip| ip.to_ipv4_mapped().is_some())
++            || self.environment.interface_ipv6s.iter().any(|ip| ip.to_ipv4_mapped().is_some())
++            || self.environment.preferred_ipv6_sources.iter().any(|source| source.ip.to_ipv4_mapped().is_some())
++        {
++            anyhow::bail!("host environment IPv6 observations must not contain IPv4-mapped addresses");
++        }
++        Ok(())
++    }
++}
++
+ #[cfg(all(target_os = "wasi", feature = "management"))]
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub(crate) struct WasiWebClientCreateConfig {
+@@ -97,3 +122,37 @@ mod tests {
+         metadata.validate().unwrap();
+     }
+ }
++
++#[cfg(test)]
++mod environment_tests {
++    use super::*;
++
++    #[test]
++    fn update_validates_version_revision_and_address_families() {
++        let mut update = WasiEnvironmentUpdate {
++            version: crate::wasi::abi::ENVIRONMENT_UPDATE_VERSION,
++            revision: 1,
++            environment: HostConnectorEnvironmentSnapshot::default(),
++        };
++        update.validate().unwrap();
++        update.revision = 0;
++        assert!(update.validate().is_err());
++        update.revision = 1;
++        update.version = 2;
++        assert!(update.validate().is_err());
++
++        update.version = crate::wasi::abi::ENVIRONMENT_UPDATE_VERSION;
++        let mut value = serde_json::to_value(update).unwrap();
++        value["environment"]["interface_ipv4s"] = serde_json::json!(["2001:db8::1"]);
++        assert!(serde_json::from_value::<WasiEnvironmentUpdate>(value).is_err());
++        let update = WasiEnvironmentUpdate {
++            version: crate::wasi::abi::ENVIRONMENT_UPDATE_VERSION,
++            revision: 1,
++            environment: HostConnectorEnvironmentSnapshot {
++                interface_ipv6s: vec!["::ffff:192.0.2.1".parse().unwrap()],
++                ..Default::default()
++            },
++        };
++        assert!(update.validate().is_err());
++    }
++}
+diff --git a/easytier-core/src/wasi/web_client.rs b/easytier-core/src/wasi/web_client.rs
+index 1b81493..faa3e2e 100644
+--- a/easytier-core/src/wasi/web_client.rs
++++ b/easytier-core/src/wasi/web_client.rs
+@@ -9,7 +9,8 @@ use url::Url;
+ use crate::{
+     config::{api_input::NetworkConfigExt, toml::ConfigLoader},
+     connectivity::{
+-        connector_host::{ConnectorHost, new_connector_host},
++        composite::ConnectorHostAdapter,
++        connector_host::{ConnectorHost, HostConnectorRuntime, HostConnectorEnvironmentState},
+         manual::{
+             ManualConnectorOptions, ManualTunnelConnector, discovery::ManualEndpointDiscoveryConfig,
+         },
+@@ -287,6 +288,7 @@ impl WasiWebClientRuntime {
+     pub(super) fn new(
+         config: WasiWebClientCreateConfig,
+         process_runtime: Arc<CoreProcessRuntime>,
++        environment_state: Arc<HostConnectorEnvironmentState>,
+     ) -> anyhow::Result<Self> {
+         let endpoint = ConfigServerEndpoint::parse(&config.endpoint, |url| {
+             matches!(url.scheme(), "tcp" | "udp")
+@@ -302,12 +304,13 @@ impl WasiWebClientRuntime {
+         let client = {
+             let _domain = enter_domain(WEB_CLIENT_DOMAIN);
+             let _runtime = runtime.enter();
+-            let host = Arc::new(new_connector_host(
++            let connector_runtime = Arc::new(HostConnectorRuntime::new(
+                 socket_runtime.clone(),
+                 Arc::new(WasiHostSocketBackend::default()),
+                 config.environment,
+                 Arc::new(WasiHostConnectorEnvironmentIo),
+-            ));
++            ).with_environment_state(environment_state));
++            let host = Arc::new(ConnectorHostAdapter::new(connector_runtime.clone(), connector_runtime));
+             let dns = Arc::new(HostDnsResolver::new(
+                 socket_runtime.clone(),
+                 Arc::new(WasiHostDnsIo),
+-- 
+2.55.0.windows.5
+

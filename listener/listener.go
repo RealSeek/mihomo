@@ -546,13 +546,16 @@ func PatchTun(patch func(last LC.Tun) LC.Tun, tunnel C.Tunnel) {
 		}
 	}()
 
-	if tunConf.Equal(LastTunConf) && slices.Equal(ebpfExclude, lastTunEBPFExclude) {
+	if tunConf.Equal(LastTunConf) && slices.Equal(ebpfExclude, lastTunEBPFExclude) && (tunLister == nil || !tunLister.EasyTierChanged(tunnel)) {
 		if tunLister != nil { // some default value in dialer maybe changed when config reload, reset at here
 			tunLister.OnReload()
 		}
 		return
 	}
 
+	if tunLister != nil {
+		tunLister.CloseReplacedEasyTier(tunnel)
+	}
 	closeTunListener()
 
 	if !tunConf.Enable {

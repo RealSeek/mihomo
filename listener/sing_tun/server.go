@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/dialer"
+	et "github.com/metacubex/mihomo/component/easytier"
 	"github.com/metacubex/mihomo/component/netchange"
 	"github.com/metacubex/mihomo/component/power"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -41,11 +43,17 @@ var InterfaceName = "Meta"
 var EnforceBindInterface = false
 
 type Listener struct {
-	closed  bool
-	options LC.Tun
-	handler *ListenerHandler
-	tunName string
-	addrStr string
+	closed           bool
+	options          LC.Tun
+	handler          *ListenerHandler
+	tunName          string
+	addrStr          string
+	easyTierAdapters map[string]C.ProxyAdapter
+	easyTierRoutes   *easyTierRoutes
+	easyTierOverlay  *et.OverlayAddressLease
+	easyTierCancel   context.CancelFunc
+	easyTierDone     chan struct{}
+	easyTierMTU      uint32
 
 	tunIf    tun.Tun
 	tunStack tun.Stack
@@ -144,6 +152,14 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	}
 	ctx := context.TODO()
 	rpTunnel := tunnel.(P.Tunnel)
+	if len(options.EasyTier) > 0 {
+		if options.Stack != C.TunMips {
+			return nil, fmt.Errorf("easytier: shared TUN requires stack: mips")
+		}
+		if options.GSO || options.AutoRedirect {
+			return nil, fmt.Errorf("easytier: shared TUN currently requires gso and auto-redirect disabled")
+		}
+	}
 	if options.GSOMaxSize == 0 {
 		options.GSOMaxSize = 65536
 	}
@@ -198,7 +214,11 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	})
 	tunMTU := options.MTU
 	if tunMTU == 0 {
-		tunMTU = 9000
+		if len(options.EasyTier) > 0 {
+			tunMTU = 1380
+		} else {
+			tunMTU = 9000
+		}
 	}
 	var udpTimeout time.Duration
 	if options.UDPTimeout != 0 {
@@ -394,6 +414,23 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		}
 	}
 
+	// Bind the first underlay sockets before installing any shared TUN routes.
+	startCtx, stopStart := context.WithTimeout(ctx, 30*time.Second)
+	packetSessions, adapters, err := openEasyTierSessions(startCtx, options.EasyTier, tunnel)
+	stopStart()
+	if err != nil {
+		return nil, err
+	}
+	l.easyTierAdapters = adapters
+	if err := validateEasyTierSessions(packetSessions, append(slices.Clone(options.Inet4Address), options.Inet6Address...)); err != nil {
+		return nil, err
+	}
+	for _, session := range packetSessions {
+		if options.MTU != 0 && options.MTU > session.MTU {
+			return nil, fmt.Errorf("easytier: TUN MTU %d exceeds overlay MTU %d", options.MTU, session.MTU)
+		}
+	}
+
 	tunOptions := tun.Options{
 		Name:                                  tunName,
 		MTU:                                   tunMTU,
@@ -430,7 +467,32 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		EXP_SendMsgX:                          options.SendMsgX,
 		EXP_ProcessorsPerChannel:              options.ProcessorsPerChannel,
 	}
+	if len(packetSessions) > 0 {
+		if options.MTU == 0 {
+			tunMTU = packetSessions[0].MTU
+			for _, session := range packetSessions[1:] {
+				if session.MTU < tunMTU {
+					tunMTU = session.MTU
+				}
+			}
+			tunOptions.MTU = tunMTU
+		}
+		// Keep mihomo's own DNS/gateway addresses separate from overlay addresses.
+		tunOptions.Inet4Address = slices.Clone(tunOptions.Inet4Address)
+		tunOptions.Inet6Address = slices.Clone(tunOptions.Inet6Address)
+		for _, session := range packetSessions {
+			for _, address := range session.Addresses {
+				if address.Addr().Is4() {
+					tunOptions.Inet4Address = append(tunOptions.Inet4Address, address)
+				} else {
+					tunOptions.Inet6Address = append(tunOptions.Inet6Address, address)
+				}
+			}
+		}
+	}
 
+	l.easyTierMTU = tunMTU
+	l.setEasyTierPacketPolicies()
 	if options.AutoRedirect {
 		l.routeAddressMap = make(map[string]*netipx.IPSet)
 		l.routeExcludeAddressMap = make(map[string]*netipx.IPSet)
@@ -486,12 +548,28 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		err = E.Cause(err, "build android rules")
 		return
 	}
+	if len(options.EasyTier) > 0 {
+		// Register the overlay addresses before creating the device. Creating a
+		// native Android TUN changes the interface/address view and can emit a
+		// network-change callback while the kernel setup is still in progress;
+		// the callback must not advertise an EasyTier address as an underlay
+		// source during that window.
+		l.easyTierOverlay = et.NewOverlayAddressLease()
+		l.easyTierOverlay.Update(easyTierSessionAddresses(packetSessions))
+	}
 	tunIf, err := tunNew(tunOptions)
 	if err != nil {
 		err = E.Cause(err, "configure tun interface")
 		return
 	}
 	tunIf = guardTunClose(tunIf)
+	l.tunIf = tunIf
+	if len(options.EasyTier) > 0 {
+		l.easyTierRoutes, err = newEasyTierRoutes(tunOptions, packetSessions)
+		if err != nil {
+			return
+		}
+	}
 
 	l.dnsServerIp = dnsServerIp
 	// after tun.New sing-tun has set DNS to TUN interface
@@ -511,6 +589,15 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		TCPCongestionControl:   options.CongestionController,
 		EnforceBindInterface:   EnforceBindInterface,
 	}
+	if len(options.EasyTier) > 0 {
+		tunIf, err = newEasyTierDevice(tunIf, packetSessions, tunMTU, runtime.GOOS == "darwin", handler.keepEasyTierPacketLocal, func(err error) {
+			log.Warnln("[EasyTier] shared TUN packet: %v", err)
+		})
+		if err != nil {
+			return
+		}
+		stackOptions.Tun = tunIf
+	}
 	l.tunIf = tunIf
 
 	tunStack, err := tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
@@ -523,6 +610,11 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		return
 	}
 	l.tunStack = tunStack
+	if len(options.EasyTier) > 0 {
+		l.startEasyTierSync(tunIf.(interface {
+			UpdateSessions([]et.PacketSession) error
+		}))
+	}
 
 	if l.autoRedirect != nil {
 		if len(l.options.RouteAddressSet) > 0 && len(l.routeAddressSet) == 0 {
@@ -559,6 +651,61 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s",
 		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack)
 	return
+}
+
+func openEasyTierSessions(ctx context.Context, names []string, tunnel C.Tunnel) ([]et.PacketSession, map[string]C.ProxyAdapter, error) {
+	if len(names) == 0 {
+		return nil, nil, nil
+	}
+	proxies := tunnel.(interface{ Proxies() map[string]C.Proxy }).Proxies()
+	adapters := make(map[string]C.ProxyAdapter, len(names))
+	sessions := make([]et.PacketSession, 0, len(names))
+	for _, name := range names {
+		proxy, ok := proxies[name]
+		if !ok {
+			return nil, nil, fmt.Errorf("easytier shared TUN proxy %q not found", name)
+		}
+		provider, ok := N.FindUpstream[et.PacketSessionsProvider](proxy.Adapter(), nil)
+		if !ok {
+			return nil, nil, fmt.Errorf("proxy %q is not an EasyTier packet provider", name)
+		}
+		networks, err := provider.OpenPacketSessions(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		sessions = append(sessions, networks...)
+		adapters[name] = proxy.Adapter()
+	}
+	return sessions, adapters, nil
+}
+
+func (l *Listener) EasyTierChanged(tunnel C.Tunnel) bool {
+	if len(l.easyTierAdapters) == 0 {
+		return false
+	}
+	proxies := tunnel.(interface{ Proxies() map[string]C.Proxy }).Proxies()
+	for name, adapter := range l.easyTierAdapters {
+		proxy, ok := proxies[name]
+		if !ok || proxy.Adapter() != adapter {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *Listener) CloseReplacedEasyTier(tunnel C.Tunnel) {
+	if len(l.easyTierAdapters) == 0 {
+		return
+	}
+	proxies := tunnel.(interface{ Proxies() map[string]C.Proxy }).Proxies()
+	for name, adapter := range l.easyTierAdapters {
+		proxy, ok := proxies[name]
+		if !ok || proxy.Adapter() != adapter {
+			if err := adapter.Close(); err != nil {
+				log.Warnln("[EasyTier](%s) close replaced instance: %v", name, err)
+			}
+		}
+	}
 }
 
 func (l *Listener) ruleUpdateCallback(ruleProvider P.RuleProvider) {
@@ -682,6 +829,16 @@ func parseRange[T constraints.Integer](uidRanges []ranges.Range[T], rangeList []
 
 func (l *Listener) Close() error {
 	l.closed = true
+	for _, adapter := range l.easyTierAdapters {
+		provider, ok := N.FindUpstream[et.PacketSessionsProvider](adapter, nil)
+		if ok {
+			provider.SetPacketConfigPolicy(nil)
+		}
+	}
+	if l.easyTierCancel != nil {
+		l.easyTierCancel()
+		<-l.easyTierDone
+	}
 	_ = l.backgroundNetwork.Close()
 	clearTunRouteClaim()
 	resolver.RemoveSystemDnsBlacklist(l.dnsServerIp...)
@@ -693,6 +850,8 @@ func (l *Listener) Close() error {
 	}
 	return common.Close(
 		l.ruleUpdateCallbackCloser,
+		common.PtrOrNil(l.easyTierRoutes),
+		common.PtrOrNil(l.easyTierOverlay),
 		l.tunStack,
 		l.tunIf,
 		l.autoRedirect,

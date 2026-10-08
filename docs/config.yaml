@@ -134,6 +134,8 @@ profile: # 存储 select 选择记录
 tun:
   enable: false
   stack: mips # gvisor/mixed/system
+  # 将指定 EasyTier 出站接入本 TUN；不会创建第二个 TUN 设备。支持固定 ipv4 或 DHCP，stack 使用 mips。
+  # easytier: [easytier]
   dns-hijack:
     - 0.0.0.0:53 # 需要劫持的 DNS
   # auto-detect-interface: true # 自动识别出口网卡
@@ -315,7 +317,7 @@ dns:
     - dhcp://en0 # dns from dhcp
     - quic://dns.adguard.com:784 # DNS over QUIC
     # - ts://tailscale # 使用指定 Tailscale 出站的 DNS 配置查询
-    # - et://easytier # 仅解析 overlay A/PTR；建议放在 nameserver-policy
+    # - et://easytier # 解析 overlay A/AAAA/PTR；建议放在 nameserver-policy
     # - '8.8.8.8#RULES' # 效果同respect-rules，但仅对该服务器生效
     # - '8.8.8.8#en0' # 兼容指定 DNS 出口网卡
 
@@ -1396,14 +1398,27 @@ proxies: # socks5
     # ip-version: ipv4-prefer
 
   # easytier
-  # overlay 仅支持 IPv4；ip-version 只影响底层 peer 连接，不启用 overlay IPv6
+  # 共享 TUN 支持 overlay IPv4/IPv6；代理 socket dial 当前仅支持 IPv4，ip-version 影响底层 peer 连接
+  # Windows 和 root Android 通用示例：tun 使用 mips，并开启 auto-detect-interface，
+  # 使 EasyTier peer 在 Wi-Fi/移动数据切换后跟随实际出口网卡。Android 需通过 su 运行，
+  # Windows 需管理员权限；不要把 interface-name 固定为某个会变化的网卡名。
+  # 完整配置见 docs/examples/easytier-realseek-windows.yaml 和
+  # docs/examples/easytier-realseek-android-root.yaml；网络密钥需自行填写。
+  #
+  # tun:
+  #   enable: true
+  #   stack: mips
+  #   auto-route: true
+  #   auto-detect-interface: true
+  #   easytier: [easytier]
   - name: "easytier"
     type: easytier
     network-name: example
     network-secret: secret
     # hostname: mihomo
     # ipv4: 10.144.0.1/24
-    # dhcp: true # ipv4 为空时默认开启，否则实例没有 overlay IPv4
+    # ipv6: fd00:144::1/64 # 共享 TUN 和 Magic DNS AAAA/PTR 使用此虚拟 IPv6 地址
+    # dhcp: true # ipv4/ipv6 都为空时默认开启；仅配置 ipv6 时不自动启用 IPv4 DHCP
     peers: # 可配置多个入口；默认不隐式连接 public.easytier.top；无 listeners 时至少填一个
       - tcp://192.0.2.10:11010
       - udp://192.0.2.11:11010
@@ -1415,9 +1430,17 @@ proxies: # socks5
     # no-listener: true # 默认 true，listeners 为空
     # mapped-listeners: ["tcp://203.0.113.10:11010"]
     # exit-nodes: ["10.144.0.1"]
+    # routes: ["192.0.2.0/24"] # 手动 IPv4 路由；显式 [] 表示不接受核心自动发布的 proxy CIDR
     # proxy-networks: ["10.0.0.0/24"]
+    # port-forwards: # 官方核心监听本机端口并转发到 overlay IPv4；protocol 只能为 tcp/udp
+    #   - protocol: tcp
+    #     bind: "127.0.0.1:18080"
+    #     destination: "10.144.0.2:8080"
+    #   - protocol: udp
+    #     bind: "127.0.0.1:15353"
+    #     destination: "10.144.0.2:5353"
     # instance-name: mihomo-easytier
-    # state-dir: ./easytier # 默认 easytier/<name>，用于持久化 instance_id
+    # state-dir: ./easytier # 默认 easytier/<name>，用于持久化 instance_id / 配置中心 machine-id
     udp: true
     # accept-dns: false
     # enable-exit-node: false
@@ -1432,10 +1455,35 @@ proxies: # socks5
     # disable-quic-input: false
     # mtu: 1380
     # tld-dns-zone: et.net.
+    # config-toml: | # 可直接使用官方 EasyTier TOML；未映射字段（ACL 等）原样交给官方核心
+    #   ipv4 = "10.144.0.1/24"
+    #   [network_identity]
+    #   network_name = "example"
+    #   network_secret = "secret"
+    #   [flags]
+    #   mtu = 1380
     # dialer-proxy: "ss1"
     # interface-name: "WLAN"
     # routing-mark: 6666
     # ip-version: ipv4-prefer
+    # stun-servers: ["stun.example.com:3478"]
+    # stun-servers-v6: ["[2001:db8::1]:3478"]
+    # need-p2p: true
+    # lazy-p2p: false
+    # disable-tcp-hole-punch: false
+    # disable-udp-hole-punch: false
+    # disable-sym-hole-punch: false
+
+  # 配置中心管理的多个网络统一接入 tun.easytier 中指定的 mips TUN。
+  # 不与静态网络字段（network-name / ipv4 / peers / mtu / config-toml 等）同时设置；网络配置由配置中心下发。
+  # - name: easytier-managed
+  #   type: easytier
+  #   web-client:
+  #     endpoint: "tcp://config.example.com:22020/token"
+  #     # machine-id: "550e8400-e29b-41d4-a716-446655440000" # 默认生成并持久化
+  #     # hostname: mihomo
+  #     # secure-mode: false
+  #   # state-dir: ./easytier/managed
 
   # openvpn
   - name: "openvpn"

@@ -1,0 +1,238 @@
+From 7ebf5662b96093a9dede130620d1dd395e4a7863 Mon Sep 17 00:00:00 2001
+From: mihomo-build <mihomo-build@localhost>
+Date: Thu, 8 Oct 2026 13:24:31 +0800
+Subject: [PATCH] mihomo: bind external listeners through host ABI
+
+---
+ .../management/instance_rpc/packet_proxy.rs   | 26 ++++--
+ easytier-core/src/wasi/adapter/tunnel.rs      | 87 +++++++++++++++----
+ easytier-core/src/wasi/imports.rs             | 12 +++
+ easytier-core/src/wasi/runtime.rs             |  2 +-
+ 4 files changed, 100 insertions(+), 27 deletions(-)
+
+diff --git a/easytier-core/src/management/instance_rpc/packet_proxy.rs b/easytier-core/src/management/instance_rpc/packet_proxy.rs
+index 69bc8fb..a158495 100644
+--- a/easytier-core/src/management/instance_rpc/packet_proxy.rs
++++ b/easytier-core/src/management/instance_rpc/packet_proxy.rs
+@@ -148,12 +148,24 @@ where
+         request: ListTcpProxyEntryRequest,
+     ) -> rpc_types::error::Result<ListTcpProxyEntryResponse> {
+         let instance = self.instance(request.instance.as_ref())?;
+-        Ok(ListTcpProxyEntryResponse {
+-            entries: instance
+-                .tcp_proxy_entry_snapshots()
+-                .into_iter()
+-                .map(|entry| tcp_entry_snapshot_to_api(entry, TcpProxyEntryTransportType::Tcp))
+-                .collect(),
+-        })
++        let mut entries: Vec<_> = instance
++            .tcp_proxy_entry_snapshots()
++            .into_iter()
++            .map(|entry| tcp_entry_snapshot_to_api(entry, TcpProxyEntryTransportType::Tcp))
++            .collect();
++        for (transport, transport_type) in [
++            (WrappedTransportKind::Kcp, TcpProxyEntryTransportType::Kcp),
++            (WrappedTransportKind::Quic, TcpProxyEntryTransportType::Quic),
++        ] {
++            for role in [WrappedTransportRole::Source, WrappedTransportRole::Destination] {
++                entries.extend(
++                    instance
++                        .wrapped_tcp_proxy_entry_snapshots(transport, role)
++                        .into_iter()
++                        .map(|entry| tcp_entry_snapshot_to_api(entry, transport_type)),
++                );
++            }
++        }
++        Ok(ListTcpProxyEntryResponse { entries })
+     }
+ }
+diff --git a/easytier-core/src/wasi/adapter/tunnel.rs b/easytier-core/src/wasi/adapter/tunnel.rs
+index 94ae4a7..5dee38c 100644
+--- a/easytier-core/src/wasi/adapter/tunnel.rs
++++ b/easytier-core/src/wasi/adapter/tunnel.rs
+@@ -18,7 +18,8 @@ use crate::{
+     wasi::{
+         imports::{
+             HOST_PENDING, HOST_TUNNEL_CLOSED, cancel_operation, close, start_tunnel_receive,
+-            start_tunnel_send, take_tunnel_receive, take_tunnel_send,
++            start_tunnel_send, take_tunnel_receive, take_tunnel_send, start_tunnel_bind,
++            take_tunnel_bind, start_tunnel_accept, take_tunnel_accept,
+         },
+         wire::common::{host_error, status},
+     },
+@@ -270,7 +271,8 @@ impl WasiHostTunnelIngress {
+         TcpSocket: VirtualTcpSocket,
+     {
+         Arc::new(WasiHostTunnelListenerFactory {
+-            queue: self.queue.clone(),
++            runtime: self.runtime.clone(),
++            io: self.io.clone(),
+             supported_schemes: self.supported_schemes.clone(),
+         })
+     }
+@@ -300,7 +302,8 @@ impl WasiHostTunnelIngress {
+ }
+ 
+ struct WasiHostTunnelListenerFactory {
+-    queue: Arc<HostTunnelQueue>,
++    runtime: crate::host::socket::HostSocketRuntime,
++    io: Arc<WasiHostTunnelIo>,
+     supported_schemes: Arc<[String]>,
+ }
+ 
+@@ -320,18 +323,22 @@ where
+         request: ExternalListenerRequest,
+     ) -> Box<dyn SocketListener<Accepted = AcceptedTransport<TcpSocket>>> {
+         Box::new(WasiHostTunnelListener {
+-            registered: self.queue.register_listener(),
+-            queue: self.queue.clone(),
++            runtime: self.runtime.clone(),
++            io: self.io.clone(),
++            handle: None,
+             local_url: request.url,
++            socket_context: request.socket_context,
+             tcp_socket: PhantomData,
+         })
+     }
+ }
+ 
+ struct WasiHostTunnelListener<TcpSocket> {
+-    registered: bool,
+-    queue: Arc<HostTunnelQueue>,
++    runtime: crate::host::socket::HostSocketRuntime,
++    io: Arc<WasiHostTunnelIo>,
++    handle: Option<HostSocketHandle>,
+     local_url: url::Url,
++    socket_context: crate::socket::SocketContext,
+     tcp_socket: PhantomData<fn() -> TcpSocket>,
+ }
+ 
+@@ -340,7 +347,7 @@ impl<TcpSocket> fmt::Debug for WasiHostTunnelListener<TcpSocket> {
+         formatter
+             .debug_struct("WasiHostTunnelListener")
+             .field("local_url", &self.local_url)
+-            .field("registered", &self.registered)
++            .field("handle", &self.handle)
+             .finish()
+     }
+ }
+@@ -353,18 +360,34 @@ where
+     type Accepted = AcceptedTransport<TcpSocket>;
+ 
+     async fn listen(&mut self) -> anyhow::Result<()> {
+-        if !self.registered {
+-            anyhow::bail!("Host Tunnel listener queue is closed");
+-        }
++        let encoded = self.local_url.as_str().as_bytes();
++        let context = crate::wasi::wire::options::encode_socket_context(&self.socket_context)?;
++        let result: BoundTunnelListener = self.runtime.run_operation(
++            self.io.clone(),
++            |_, operation| status("start_tunnel_bind", unsafe {
++                start_tunnel_bind(operation.0, encoded.as_ptr() as u32, encoded.len() as u32,
++                    context.as_ptr() as u32, context.len() as u32)
++            }),
++            |_, operation| take_tunnel_json(operation, take_tunnel_bind),
++            |io, operation| io.cancel_operation(operation),
++        ).await?;
++        self.handle = Some(HostSocketHandle(result.handle));
++        self.local_url = result.local_url;
+         Ok(())
+     }
+ 
+     async fn accept(&mut self) -> anyhow::Result<Self::Accepted> {
+-        let tunnel = self
+-            .queue
+-            .accept()
+-            .await
+-            .ok_or_else(|| anyhow::anyhow!("Host Tunnel listener queue is closed"))?;
++        let handle = self.handle.ok_or_else(|| anyhow::anyhow!("host tunnel listener is not bound"))?;
++        let result: AcceptedTunnel = self.runtime.run_operation(
++            self.io.clone(),
++            |_, operation| status("start_tunnel_accept", unsafe { start_tunnel_accept(handle.0, operation.0) }),
++            |_, operation| take_tunnel_json(operation, take_tunnel_accept),
++            |io, operation| io.cancel_operation(operation),
++        ).await?;
++        let tunnel = crate::tunnel::host_tunnel::new_host_tunnel(
++            self.runtime.clone(), self.io.clone(), HostSocketHandle(result.handle),
++            result.local_url, result.remote_url, result.resolved_remote_url,
++        );
+         Ok(AcceptedTransport::Tunnel {
+             tunnel,
+             local_url: self.local_url.clone(),
+@@ -378,8 +401,34 @@ where
+ 
+ impl<TcpSocket> Drop for WasiHostTunnelListener<TcpSocket> {
+     fn drop(&mut self) {
+-        if self.registered {
+-            self.queue.unregister_listener();
+-        }
++        if let Some(handle) = self.handle.take() { let _ = self.io.close(handle); }
+     }
+ }
++
++#[derive(serde::Deserialize)]
++struct BoundTunnelListener {
++    handle: u64,
++    local_url: url::Url,
++}
++
++#[derive(serde::Deserialize)]
++struct AcceptedTunnel {
++    handle: u64,
++    local_url: url::Url,
++    remote_url: url::Url,
++    resolved_remote_url: Option<url::Url>,
++}
++
++fn take_tunnel_json<T: serde::de::DeserializeOwned>(
++    operation: HostOperationId,
++    take: unsafe extern "C" fn(u64, u32, u32) -> i32,
++) -> Poll<io::Result<T>> {
++    let length = unsafe { take(operation.0, 0, 0) };
++    if length == HOST_PENDING { return Poll::Pending; }
++    if length < 0 { return Poll::Ready(Err(host_error("take_tunnel_result", length))); }
++    if length > 16 * 1024 { return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "host tunnel metadata exceeds limit"))); }
++    let mut buffer = vec![0; length as usize];
++    let copied = unsafe { take(operation.0, buffer.as_mut_ptr() as u32, buffer.len() as u32) };
++    if copied != length { return Poll::Ready(Err(host_error("take_tunnel_result copy", copied))); }
++    Poll::Ready(serde_json::from_slice(&buffer).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)))
++}
+diff --git a/easytier-core/src/wasi/imports.rs b/easytier-core/src/wasi/imports.rs
+index c98f6b3..1697f8b 100644
+--- a/easytier-core/src/wasi/imports.rs
++++ b/easytier-core/src/wasi/imports.rs
+@@ -217,6 +217,18 @@ unsafe extern "C" {
+     /// Reports completion of one host tunnel send.
+     pub(crate) fn take_tunnel_send(operation: u64) -> i32;
+ 
++    #[cfg(feature = "wasm-host-tunnel")]
++    pub(crate) fn start_tunnel_bind(operation: u64, url: u32, url_len: u32, context: u32, context_len: u32) -> i32;
++
++    #[cfg(feature = "wasm-host-tunnel")]
++    pub(crate) fn take_tunnel_bind(operation: u64, result: u32, capacity: u32) -> i32;
++
++    #[cfg(feature = "wasm-host-tunnel")]
++    pub(crate) fn start_tunnel_accept(handle: u64, operation: u64) -> i32;
++
++    #[cfg(feature = "wasm-host-tunnel")]
++    pub(crate) fn take_tunnel_accept(operation: u64, result: u32, capacity: u32) -> i32;
++
+     #[cfg(feature = "wasm-host-tunnel-outbound")]
+     /// Starts opening one outbound host tunnel for the requested URL.
+     pub(crate) fn start_tunnel_connect(operation: u64, url: u32, url_len: u32) -> i32;
+diff --git a/easytier-core/src/wasi/runtime.rs b/easytier-core/src/wasi/runtime.rs
+index 0a9c1b9..3971659 100644
+--- a/easytier-core/src/wasi/runtime.rs
++++ b/easytier-core/src/wasi/runtime.rs
+@@ -98,7 +98,7 @@ pub(super) fn new_wasi_core_runtime(
+     let socket_backend = Arc::new(WasiHostSocketBackend::default());
+     let environment_io = Arc::new(WasiHostConnectorEnvironmentIo);
+     #[cfg(feature = "wasm-host-tunnel")]
+-    let host_tunnel_schemes: Arc<[String]> = Arc::from(["ws".to_owned(), "wss".to_owned()]);
++    let host_tunnel_schemes: Arc<[String]> = Arc::from(["ws".to_owned(), "wss".to_owned(), "faketcp".to_owned()]);
+     #[cfg(feature = "wasm-host-tunnel")]
+     let tunnel_io = Arc::new(crate::wasi::adapter::tunnel::WasiHostTunnelIo::default());
+     let connector_runtime = HostConnectorRuntime::new(
+-- 
+2.55.0.windows.5
+

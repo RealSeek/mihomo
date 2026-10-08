@@ -1,0 +1,45 @@
+From e0581d514bc145aeccfa4e85e50be5a394844041 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 8 Oct 2026 02:10:49 +0800
+Subject: [PATCH 3/6] register complete bound management services
+
+---
+ easytier-core/src/management/mod.rs | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/easytier-core/src/management/mod.rs b/easytier-core/src/management/mod.rs
+index dd2c609..389cec9 100644
+--- a/easytier-core/src/management/mod.rs
++++ b/easytier-core/src/management/mod.rs
+@@ -15,9 +15,13 @@ use crate::{
+     instance::{CoreInstance, CoreInstanceHost, manager::InstanceFactory},
+     rpc::service_registry::ServiceRegistry,
+ };
+-use easytier_proto::api::instance::{ConnectorManageRpcServer, PeerManageRpcServer};
++use easytier_proto::api::instance::{
++    AclManageRpcServer, ConnectorManageRpcServer, CredentialManageRpcServer,
++    MappedListenerManageRpcServer, PeerManageRpcServer, PortForwardManageRpcServer,
++    StatsRpcServer, TcpProxyRpcServer, VpnPortalRpcServer,
++};
+ #[cfg(all(feature = "management", target_os = "wasi"))]
+-use easytier_proto::api::{config::ConfigRpcServer, instance::CredentialManageRpcServer};
++use easytier_proto::api::config::ConfigRpcServer;
+ 
+ pub use crate::instance::manager::{
+     ConfigFileControl, ConfigFilePermission, DaemonGuard, InstanceManager, ProcessRuntimeProvider,
+@@ -77,6 +81,12 @@ pub(crate) fn register_bound_management_rpc<H>(
+     let rpc = instance_rpc::bound_rpc(instance);
+     registry.register(PeerManageRpcServer::new(rpc.clone()), "");
+     registry.register(ConnectorManageRpcServer::new(rpc.clone()), "");
++    registry.register(MappedListenerManageRpcServer::new(rpc.clone()), "");
++    registry.register(VpnPortalRpcServer::new(rpc.clone()), "");
++    registry.register(TcpProxyRpcServer::new(rpc.clone()), "");
++    registry.register(AclManageRpcServer::new(rpc.clone()), "");
++    registry.register(PortForwardManageRpcServer::new(rpc.clone()), "");
++    registry.register(StatsRpcServer::new(rpc.clone()), "");
+     #[cfg(feature = "management")]
+     {
+         registry.register(ConfigRpcServer::new(rpc.clone()), "");
+-- 
+2.55.0.windows.5
+

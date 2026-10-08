@@ -24,9 +24,10 @@ const providerConcurrency = 4
 // fanOut are the stages of a network change, kept as fields instead of direct
 // calls so tests can drive the sequencing without a real resolver or providers.
 type fanOut struct {
-	flushCache      func()
-	resetConnection func()
-	providers       func() map[string]P.ProxyProvider
+	flushCache         func()
+	resetConnection    func()
+	refreshEnvironment func(context.Context)
+	providers          func() map[string]P.ProxyProvider
 }
 
 type notifier struct {
@@ -40,9 +41,10 @@ type notifier struct {
 }
 
 var defaultNotifier = &notifier{work: fanOut{
-	flushCache:      iface.FlushCache,
-	resetConnection: resolver.ResetConnection,
-	providers:       tunnel.Providers,
+	flushCache:         iface.FlushCache,
+	resetConnection:    resolver.ResetConnection,
+	refreshEnvironment: refreshEasyTierEnvironment,
+	providers:          tunnel.Providers,
 }}
 
 // Notify reports that the default interface changed. A flapping link
@@ -83,6 +85,12 @@ func (n *notifier) run(ctx context.Context, work fanOut) {
 		return
 	}
 	work.resetConnection()
+	if ctx.Err() != nil {
+		return
+	}
+	if work.refreshEnvironment != nil {
+		work.refreshEnvironment(ctx)
+	}
 	if ctx.Err() != nil {
 		return
 	}

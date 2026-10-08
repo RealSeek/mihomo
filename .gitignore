@@ -24,6 +24,9 @@ vendor
 # test suite
 test/config/cache*
 /output
+/third_party/easytier-go/output/
+/.tools/easytier-upgrade/
+/.tools/easytier-w568w/
 .vscode/
 .fleet/
 # Built debug utilities (source lives in cmd/)

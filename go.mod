@@ -2,12 +2,14 @@ module github.com/metacubex/mihomo
 
 go 1.25.0
 
+replace github.com/easytier/easytier/easytier-go => ./third_party/easytier-go
+
 require (
 	github.com/bahlo/generic-list-go v0.2.0
 	github.com/cilium/ebpf v0.22.1-0.20260724091036-00feb08ae4e5
 	github.com/coreos/go-iptables v0.8.0
 	github.com/dlclark/regexp2 v1.12.0
-	github.com/easytier/easytier/easytier-go v0.0.0-20260910071355-3d0c9c3ca5e2
+	github.com/easytier/easytier/easytier-go v0.0.0-20261005082529-8b7f1f0196ed
 	github.com/enfein/mieru/v3 v3.38.0
 	github.com/gobwas/ws v1.4.0
 	github.com/gofrs/uuid/v5 v5.4.0
@@ -53,6 +55,7 @@ require (
 	github.com/metacubex/zerotier-go v0.0.0-20260813124750-13fa6f45da5f
 	github.com/mroth/weightedrand/v2 v2.1.0
 	github.com/openacid/low v0.1.21
+	github.com/pelletier/go-toml/v2 v2.2.1
 	github.com/rasky/go-lzo v0.0.0-20200203143853-96a758eda86e
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
 	github.com/samber/lo v1.53.0
@@ -147,6 +150,7 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.10.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
+	nhooyr.io/websocket v1.8.6 // indirect
 )
 
 // for https://github.com/golang/protobuf/issues/1704

@@ -1,0 +1,25 @@
+From ecc0a81ce7400933874943aba3644d87a0a92165 Mon Sep 17 00:00:00 2001
+From: mihomo-build <mihomo-build@localhost>
+Date: Thu, 8 Oct 2026 13:35:48 +0800
+Subject: [PATCH] mihomo: require the userspace proxy stack in WASI
+
+---
+ easytier-core/src/wasi/runtime.rs | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/easytier-core/src/wasi/runtime.rs b/easytier-core/src/wasi/runtime.rs
+index 3971659..0d57487 100644
+--- a/easytier-core/src/wasi/runtime.rs
++++ b/easytier-core/src/wasi/runtime.rs
+@@ -129,6 +129,8 @@ pub(super) fn new_wasi_core_runtime(
+         packet_sink,
+     ));
+     let mut adapters = CoreHostAdapters::new(host, dns, packet_sink, process_runtime);
++    adapters.config.smoltcp_available = cfg!(feature = "proxy-smoltcp-stack");
++    adapters.config.requires_smoltcp = true;
+     #[cfg(feature = "public-ipv6-provider")]
+     {
+         adapters.public_ipv6_host = Some(public_ipv6_host);
+-- 
+2.55.0.windows.5
+

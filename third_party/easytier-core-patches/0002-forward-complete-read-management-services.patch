@@ -1,0 +1,75 @@
+From 83072c4273f39a96bace9638a111b0a50cda47ec Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 8 Oct 2026 01:56:21 +0800
+Subject: [PATCH 2/6] forward complete read management services
+
+---
+ easytier-core/src/management/forwarded_rpc.rs | 38 ++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/easytier-core/src/management/forwarded_rpc.rs b/easytier-core/src/management/forwarded_rpc.rs
+index fbee921..f61eba5 100644
+--- a/easytier-core/src/management/forwarded_rpc.rs
++++ b/easytier-core/src/management/forwarded_rpc.rs
+@@ -8,8 +8,10 @@ use crate::{
+         api::{
+             config::ConfigRpcDescriptor,
+             instance::{
+-                ConnectorManageRpcDescriptor, CredentialManageRpcDescriptor,
+-                PeerManageRpcDescriptor,
++                AclManageRpcDescriptor, ConnectorManageRpcDescriptor,
++                CredentialManageRpcDescriptor, MappedListenerManageRpcDescriptor,
++                PeerManageRpcDescriptor, PortForwardManageRpcDescriptor,
++                StatsRpcDescriptor, TcpProxyRpcDescriptor, VpnPortalRpcDescriptor,
+             },
+         },
+         rpc_types::{
+@@ -99,6 +101,30 @@ pub(crate) fn register_forwarded_instance_management_rpc<F>(
+         ForwardedManagementHandler::<F, CredentialManageRpcDescriptor>::new(forwarder.clone()),
+         "",
+     );
++    registry.register(
++        ForwardedManagementHandler::<F, MappedListenerManageRpcDescriptor>::new(forwarder.clone()),
++        "",
++    );
++    registry.register(
++        ForwardedManagementHandler::<F, VpnPortalRpcDescriptor>::new(forwarder.clone()),
++        "",
++    );
++    registry.register(
++        ForwardedManagementHandler::<F, TcpProxyRpcDescriptor>::new(forwarder.clone()),
++        "",
++    );
++    registry.register(
++        ForwardedManagementHandler::<F, AclManageRpcDescriptor>::new(forwarder.clone()),
++        "",
++    );
++    registry.register(
++        ForwardedManagementHandler::<F, PortForwardManageRpcDescriptor>::new(forwarder.clone()),
++        "",
++    );
++    registry.register(
++        ForwardedManagementHandler::<F, StatsRpcDescriptor>::new(forwarder.clone()),
++        "",
++    );
+     registry.register(
+         ForwardedManagementHandler::<F, ConfigRpcDescriptor>::new(forwarder),
+         "",
+@@ -141,6 +167,14 @@ mod tests {
+             "api.instance.CredentialManageRpc.UpsertCredential",
+             "api.instance.CredentialManageRpc.RevokeCredential",
+             "api.instance.CredentialManageRpc.ListCredentials",
++            "api.instance.MappedListenerManageRpc.ListMappedListener",
++            "api.instance.VpnPortalRpc.GetVpnPortalInfo",
++            "api.instance.TcpProxyRpc.ListTcpProxyEntry",
++            "api.instance.AclManageRpc.GetAclStats",
++            "api.instance.AclManageRpc.GetWhitelist",
++            "api.instance.PortForwardManageRpc.ListPortForward",
++            "api.instance.StatsRpc.GetStats",
++            "api.instance.StatsRpc.GetPrometheusStats",
+         ];
+         for (index, full_method_name) in methods.into_iter().enumerate() {
+             let descriptor = registry
+-- 
+2.55.0.windows.5
+

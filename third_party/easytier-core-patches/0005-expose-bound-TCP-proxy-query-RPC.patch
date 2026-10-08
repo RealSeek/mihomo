@@ -1,0 +1,74 @@
+From b6b7d536c07ddfbe9e49bef969af944b064312db Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 8 Oct 2026 02:31:55 +0800
+Subject: [PATCH 5/6] expose bound TCP proxy query RPC
+
+---
+ .../management/instance_rpc/packet_proxy.rs   | 24 +++++++++++++++++++
+ easytier-core/src/management/mod.rs           |  4 +++-
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/easytier-core/src/management/instance_rpc/packet_proxy.rs b/easytier-core/src/management/instance_rpc/packet_proxy.rs
+index c6cee34..69bc8fb 100644
+--- a/easytier-core/src/management/instance_rpc/packet_proxy.rs
++++ b/easytier-core/src/management/instance_rpc/packet_proxy.rs
+@@ -19,6 +19,7 @@ use crate::{
+     },
+ };
+ 
++use super::{ReadOnlyInstanceResolver, ResolvedInstanceManagementRpc};
+ use super::super::resolve_instance;
+ 
+ #[derive(Clone, Copy)]
+@@ -133,3 +134,26 @@ where
+         })
+     }
+ }
++
++#[async_trait::async_trait]
++impl<R> TcpProxyRpc for ResolvedInstanceManagementRpc<R>
++where
++    R: ReadOnlyInstanceResolver,
++{
++    type Controller = BaseController;
++
++    async fn list_tcp_proxy_entry(
++        &self,
++        _: BaseController,
++        request: ListTcpProxyEntryRequest,
++    ) -> rpc_types::error::Result<ListTcpProxyEntryResponse> {
++        let instance = self.instance(request.instance.as_ref())?;
++        Ok(ListTcpProxyEntryResponse {
++            entries: instance
++                .tcp_proxy_entry_snapshots()
++                .into_iter()
++                .map(|entry| tcp_entry_snapshot_to_api(entry, TcpProxyEntryTransportType::Tcp))
++                .collect(),
++        })
++    }
++}
+diff --git a/easytier-core/src/management/mod.rs b/easytier-core/src/management/mod.rs
+index efc9729..fb776f3 100644
+--- a/easytier-core/src/management/mod.rs
++++ b/easytier-core/src/management/mod.rs
+@@ -18,7 +18,7 @@ use crate::{
+ use easytier_proto::api::instance::{
+     AclManageRpcServer, ConnectorManageRpcServer, CredentialManageRpcServer,
+     MappedListenerManageRpcServer, PeerManageRpcServer, PortForwardManageRpcServer,
+-    StatsRpcServer, VpnPortalRpcServer,
++    StatsRpcServer, TcpProxyRpcServer, VpnPortalRpcServer,
+ };
+ #[cfg(all(feature = "management", target_os = "wasi"))]
+ use easytier_proto::api::config::ConfigRpcServer;
+@@ -83,6 +83,8 @@ pub(crate) fn register_bound_management_rpc<H>(
+     registry.register(ConnectorManageRpcServer::new(rpc.clone()), "");
+     registry.register(MappedListenerManageRpcServer::new(rpc.clone()), "");
+     registry.register(VpnPortalRpcServer::new(rpc.clone()), "");
++    registry.register(TcpProxyRpcServer::new(rpc.clone()), "");
++    registry.register(TcpProxyRpcServer::new(rpc.clone()), "tcp");
+     registry.register(AclManageRpcServer::new(rpc.clone()), "");
+     registry.register(PortForwardManageRpcServer::new(rpc.clone()), "");
+     registry.register(StatsRpcServer::new(rpc.clone()), "");
+-- 
+2.55.0.windows.5
+

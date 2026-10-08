@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"net/url"
@@ -178,6 +179,7 @@ type DNS struct {
 	ProxyServerPolicy     []dns.Policy
 	DirectNameServer      []dns.NameServer
 	DirectFollowPolicy    bool
+	EasyTier              []dns.EasyTierNetwork
 }
 
 // Profile config
@@ -283,6 +285,7 @@ type RawTun struct {
 	DNSHijack           []string   `yaml:"dns-hijack" json:"dns-hijack"`
 	AutoRoute           bool       `yaml:"auto-route" json:"auto-route"`
 	AutoDetectInterface bool       `yaml:"auto-detect-interface" json:"auto-detect-interface"`
+	EasyTier            []string   `yaml:"easytier" json:"easytier,omitempty"`
 
 	MTU        uint32 `yaml:"mtu" json:"mtu,omitempty"`
 	GSO        bool   `yaml:"gso" json:"gso,omitempty"`
@@ -733,6 +736,9 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if dnsCfg.EasyTier, err = parseEasyTierDNS(rawCfg.Tun.EasyTier, proxies); err != nil {
+		return nil, err
+	}
 	config.DNS = dnsCfg
 
 	err = parseTun(rawCfg.Tun, dnsCfg, config.General)
@@ -918,6 +924,10 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 
 	// parse proxy
 	for idx, mapping := range proxiesConfig {
+		if name, ok := mapping["name"].(string); ok && slices.Contains(cfg.Tun.EasyTier, name) {
+			mapping = maps.Clone(mapping)
+			mapping["packet-mode"] = true
+		}
 		proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(T.Tunnel))
 		if err != nil {
 			return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
@@ -1716,6 +1726,7 @@ func parseTun(rawTun RawTun, dns *DNS, general *General) error {
 		DNSHijack:           rawTun.DNSHijack,
 		AutoRoute:           rawTun.AutoRoute,
 		AutoDetectInterface: rawTun.AutoDetectInterface,
+		EasyTier:            rawTun.EasyTier,
 
 		MTU:                                   rawTun.MTU,
 		GSO:                                   rawTun.GSO,

@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"syscall"
 
+	"github.com/metacubex/mihomo/common/sockopt"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -16,37 +18,97 @@ import (
 )
 
 // Services wraps a mihomo dialer as EasyTier platform capabilities.
-func Services(d C.Dialer) platform.Services {
+func Services(d C.Dialer) (platform.Services, error) {
+	snapshot, err := EnvironmentSnapshot()
+	if err != nil {
+		return platform.Services{}, err
+	}
 	return platform.Services{
 		Sockets:     SocketFactory{Dialer: d},
 		DNS:         DNSResolver{},
 		Environment: ConnectorEnvironment{Dialer: d},
-	}
+		Snapshot:    snapshot,
+	}, nil
 }
 
 // SocketFactory creates sockets through mihomo's dialer.
 //
-// EasyTier BindDevice/SocketMark/reuse options are ignored so hole punching
-// can bind local UDP ports. Interface, routing-mark, and dialer-proxy stay on
-// the mihomo dialer. Internal TCP reservations bind locally even when
-// dialer-proxy is set. FakeTCP is not supported.
+// Interface and routing-mark come from the mihomo dialer. Direct sockets
+// honor local binding and use mihomo's combined address/port reuse policy.
+// Proxy/custom dialers cannot provide local binding, reuse, or socket marks.
+// Internal TCP reservations bind on the host even when dialer-proxy is set.
+// Network namespaces are unavailable through this host adapter.
 type SocketFactory struct {
 	Dialer C.Dialer
 }
 
 func (s SocketFactory) ConnectTCP(ctx context.Context, options platform.TCPConnectOptions) (net.Conn, error) {
 	if options.Purpose == platform.TCPConnectFake {
-		return nil, fmt.Errorf("easytier: FakeTCP is not supported")
+		return s.ConnectFakeTCP(ctx, options)
 	}
 	if options.RemoteAddr == nil {
 		return nil, fmt.Errorf("easytier: TCP connect is missing a remote address")
 	}
+	if options.Bind.Context.NetNS != nil {
+		return nil, fmt.Errorf("easytier: network namespaces are not supported")
+	}
 	network := tcpNetwork(options.Bind)
+	reuse := options.Bind.ReusePort || options.Bind.ReuseAddr != nil && *options.Bind.ReuseAddr
+	if direct, ok := s.Dialer.(dialer.Dialer); ok {
+		netDialer := &net.Dialer{}
+		if options.Bind.LocalAddr != nil {
+			netDialer.LocalAddr = options.Bind.LocalAddr
+		}
+		if reuse {
+			netDialer.Control = func(_, _ string, conn syscall.RawConn) error {
+				if err := sockopt.RawConnReuseaddr(conn); err != nil {
+					return fmt.Errorf("easytier: TCP socket reuse: %w", err)
+				}
+				return nil
+			}
+		}
+		dialOptions := []dialer.Option{dialer.WithOption(direct.Opt), dialer.WithNetDialer(netDialer)}
+		if mark := options.Bind.Context.SocketMark; mark != nil {
+			dialOptions = append(dialOptions, dialer.WithRoutingMark(int(*mark)))
+		}
+		if options.Purpose == platform.TCPConnectSTUNProbe {
+			// NAT probes need an established socket before their source port is inspected.
+			dialOptions = append(dialOptions, dialer.WithTFO(false))
+		}
+		conn, err := dialer.DialContext(ctx, network, options.RemoteAddr.String(), dialOptions...)
+		if err != nil {
+			return nil, err
+		}
+		if options.Purpose == platform.TCPConnectSTUNProbe {
+			if err := conn.(*net.TCPConn).SetLinger(0); err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("easytier: TCP STUN probe linger: %w", err)
+			}
+		}
+		return conn, nil
+	}
+	if options.Bind.Context.SocketMark != nil || reuse || options.Bind.LocalAddr != nil && (options.Bind.LocalAddr.Port != 0 || len(options.Bind.LocalAddr.IP) != 0 && !options.Bind.LocalAddr.IP.IsUnspecified()) {
+		return nil, fmt.Errorf("easytier: TCP purpose %d requires local binding, reuse, or socket mark unavailable through a proxy or custom dialer", options.Purpose)
+	}
 	return s.Dialer.DialContext(ctx, network, options.RemoteAddr.String())
 }
 
 func (s SocketFactory) BindUDP(ctx context.Context, options platform.UDPBindOptions) (net.PacketConn, error) {
+	if options.Context.NetNS != nil {
+		return nil, fmt.Errorf("easytier: network namespaces are not supported")
+	}
 	network, address := udpBind(options)
+	reuse := options.ReuseAddr || options.ReusePort
+	if direct, ok := s.Dialer.(dialer.Dialer); ok {
+		listenOptions := []dialer.Option{dialer.WithOption(direct.Opt), dialer.WithAddrReuse(reuse)}
+		if mark := options.Context.SocketMark; mark != nil {
+			listenOptions = append(listenOptions, dialer.WithRoutingMark(int(*mark)))
+		}
+		return dialer.ListenPacket(ctx, network, address, netip.AddrPort{}, listenOptions...)
+	}
+	if options.Context.SocketMark != nil || reuse || options.LocalAddr != nil && (options.LocalAddr.Port != 0 || len(options.LocalAddr.IP) != 0 && !options.LocalAddr.IP.IsUnspecified()) {
+		return nil, fmt.Errorf("easytier: UDP purpose %d requires local binding, reuse, or socket mark unavailable through a proxy or custom dialer", options.Purpose)
+	}
 	return s.Dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
 }
 
@@ -62,13 +124,20 @@ func (s SocketFactory) ListenTCP(ctx context.Context, options platform.TCPListen
 	reuse := options.Bind.ReusePort || options.Bind.ReuseAddr != nil && *options.Bind.ReuseAddr
 	listenOpts := []dialer.Option{dialer.WithAddrReuse(reuse)}
 	if direct, ok := s.Dialer.(dialer.Dialer); ok {
-		return dialer.Listen(ctx, network, address, append(listenOpts, dialer.WithOption(direct.Opt))...)
+		listenOpts = append([]dialer.Option{dialer.WithOption(direct.Opt)}, listenOpts...)
+		if mark := options.Bind.Context.SocketMark; mark != nil {
+			listenOpts = append(listenOpts, dialer.WithRoutingMark(int(*mark)))
+		}
+		return dialer.Listen(ctx, network, address, listenOpts...)
 	}
 	if externalTCPListen(options.Purpose) {
 		return nil, fmt.Errorf("easytier: TCP listeners are unavailable through a proxy or custom dialer")
 	}
 	// ProxyNAT, port leases, and hole-punch reservations must bind on the host
 	// even when peer traffic uses dialer-proxy.
+	if options.Bind.Context.SocketMark != nil {
+		listenOpts = append(listenOpts, dialer.WithRoutingMark(int(*options.Bind.Context.SocketMark)))
+	}
 	return dialer.Listen(ctx, network, address, listenOpts...)
 }
 
@@ -199,9 +268,12 @@ type ConnectorEnvironment struct {
 	Dialer C.Dialer
 }
 
-func (e ConnectorEnvironment) LocalAddrForRemote(ctx context.Context, remote *net.UDPAddr, _ platform.SocketContext) (net.Addr, error) {
+func (e ConnectorEnvironment) LocalAddrForRemote(ctx context.Context, remote *net.UDPAddr, socketContext platform.SocketContext) (net.Addr, error) {
 	if remote == nil {
 		return nil, fmt.Errorf("easytier: missing remote address")
+	}
+	if socketContext.NetNS != nil {
+		return nil, fmt.Errorf("easytier: network namespaces are not supported")
 	}
 	network := "udp"
 	if remote.IP.To4() != nil {
@@ -209,7 +281,20 @@ func (e ConnectorEnvironment) LocalAddrForRemote(ctx context.Context, remote *ne
 	} else if remote.IP.To16() != nil {
 		network = "udp6"
 	}
-	conn, err := e.Dialer.DialContext(ctx, network, remote.String())
+	var conn net.Conn
+	var err error
+	if direct, ok := e.Dialer.(dialer.Dialer); ok {
+		options := []dialer.Option{dialer.WithOption(direct.Opt)}
+		if mark := socketContext.SocketMark; mark != nil {
+			options = append(options, dialer.WithRoutingMark(int(*mark)))
+		}
+		conn, err = dialer.DialContext(ctx, network, remote.String(), options...)
+	} else {
+		if socketContext.SocketMark != nil {
+			return nil, fmt.Errorf("easytier: connector socket mark is unavailable through a proxy or custom dialer")
+		}
+		conn, err = e.Dialer.DialContext(ctx, network, remote.String())
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -274,6 +274,9 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	if mapper.useHosts {
 		middlewares = append(middlewares, withHosts(mapper.mapping))
 	}
+	if len(mapper.easyTier) != 0 {
+		middlewares = append(middlewares, withEasyTier(mapper.easyTier))
+	}
 
 	if mapper.mode == C.DNSFakeIP {
 		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL))

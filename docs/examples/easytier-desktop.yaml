@@ -1,0 +1,61 @@
+# Run with this fork's mihomo.exe in an elevated Windows terminal.
+# auto-detect-interface keeps peer traffic on the physical uplink when a TUN is
+# enabled. The Android peer can use this node's reachable TCP listener.
+# Replace both CHANGE_ME secrets in both device configurations before use.
+mode: rule
+log-level: info
+ipv6: true
+allow-lan: false
+external-controller: 127.0.0.1:9090
+secret: CHANGE_ME_CONTROLLER_SECRET
+
+dns:
+  enable: true
+  listen: 127.0.0.1:53
+  ipv6: true
+  use-hosts: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+tun:
+  enable: true
+  device: Mihomo
+  stack: mips
+  file-descriptor: 0
+  auto-route: true
+  auto-detect-interface: true
+  mtu: 1380
+  gso: false
+  auto-redirect: false
+  dns-hijack:
+    - any:53
+  easytier:
+    - mesh
+
+proxies:
+  - name: mesh
+    type: easytier
+    network-name: mihomo-mesh
+    network-secret: CHANGE_ME_NETWORK_SECRET
+    hostname: desktop
+    ipv4: 10.144.0.1/24
+    ipv6: fd00:144::1/64
+    dhcp: false
+    tld-dns-zone: et.net
+    mtu: 1380
+    udp: true
+    enable-encryption: true
+    instance-name: mesh-desktop
+    state-dir: easytier/mesh
+    # Make this TCP listener reachable at the endpoint in the Android file.
+    listeners:
+      - tcp://0.0.0.0:11010
+
+rules:
+  - MATCH,DIRECT

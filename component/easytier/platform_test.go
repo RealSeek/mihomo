@@ -71,6 +71,26 @@ func TestUDPBindPreservesWildcardPort(t *testing.T) {
 
 type forbiddenDialer struct{}
 
+func TestTCPOverlayHostServiceBypassesUnderlayDialer(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	lease := NewOverlayAddressLease()
+	lease.Update([]netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")})
+	defer lease.Close()
+	for _, purpose := range []platform.TCPConnectPurpose{platform.TCPConnectProxyNAT, platform.TCPConnectDataPlane, platform.TCPConnectPortForward} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		conn, err := (SocketFactory{Dialer: forbiddenDialer{}}).ConnectTCP(ctx, platform.TCPConnectOptions{RemoteAddr: listener.Addr().(*net.TCPAddr), Purpose: purpose})
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+	}
+}
+
 func (forbiddenDialer) DialContext(context.Context, string, string) (net.Conn, error) {
 	panic("unexpected proxy session")
 }

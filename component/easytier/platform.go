@@ -53,6 +53,12 @@ func (s SocketFactory) ConnectTCP(ctx context.Context, options platform.TCPConne
 		return nil, fmt.Errorf("easytier: network namespaces are not supported")
 	}
 	network := tcpNetwork(options.Bind)
+	// The core's userspace TCP proxy also dials services on its own overlay
+	// address. Underlay interface binding would send these sockets off-host.
+	if (options.Purpose == platform.TCPConnectProxyNAT || options.Purpose == platform.TCPConnectDataPlane || options.Purpose == platform.TCPConnectPortForward) && isOverlayAddress(options.RemoteAddr.AddrPort().Addr()) {
+		localDialer := net.Dialer{LocalAddr: options.Bind.LocalAddr}
+		return localDialer.DialContext(ctx, network, options.RemoteAddr.String())
+	}
 	reuse := options.Bind.ReusePort || options.Bind.ReuseAddr != nil && *options.Bind.ReuseAddr
 	if direct, ok := s.Dialer.(dialer.Dialer); ok {
 		netDialer := &net.Dialer{}

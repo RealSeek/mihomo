@@ -350,12 +350,12 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		handler: handler,
 		tunName: tunName,
 	}
-	defer func() {
+	defer func(created *Listener) {
 		if err != nil {
-			l.Close()
+			created.Close()
 			l = nil
 		}
-	}()
+	}(l)
 
 	interfaceFinder := DefaultInterfaceFinder
 

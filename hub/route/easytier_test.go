@@ -47,9 +47,9 @@ func TestEasyTierAPI(t *testing.T) {
 		Base: outbound.NewBase(outbound.BaseOption{Name: "mesh node", Type: C.EasyTier}),
 		status: easytier.Status{
 			Summary:    easytier.Summary{Name: "mesh node", State: "running", PacketMode: true, DNSZone: "mesh."},
-			Node:       &easytier.NodeStatus{Hostname: "phone", IPv4: "10.144.0.2"},
+			Node:       &easytier.NodeStatus{Hostname: "phone", IPv4: "10.144.0.2", UDPNAT: "Symmetric", TCPNAT: "OpenInternet", PublicIPs: []string{"203.0.113.2"}},
 			Peers:      []easytier.PeerStatus{{PeerID: 42}},
-			Routes:     []easytier.RouteStatus{{PeerID: 42, IPv4: "10.144.0.1/24"}},
+			Routes:     []easytier.RouteStatus{{PeerID: 42, IPv4: "10.144.0.1/24", UDPNAT: "FullCone", TCPNAT: "Unknown"}},
 			Provenance: easytier.Provenance{Commit: "core-commit", SHA256: "core-sha256"},
 		},
 	}
@@ -88,7 +88,7 @@ func TestEasyTierAPI(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
-	if w.Code != http.StatusOK || status.Node == nil || status.Node.IPv4 != "10.144.0.2" || len(status.Peers) != 1 || len(status.Routes) != 1 || status.Provenance.Commit != "core-commit" {
+	if w.Code != http.StatusOK || status.Node == nil || status.Node.IPv4 != "10.144.0.2" || status.Node.UDPNAT != "Symmetric" || status.Node.TCPNAT != "OpenInternet" || status.Node.PublicIPs[0] != "203.0.113.2" || len(status.Peers) != 1 || len(status.Routes) != 1 || status.Routes[0].UDPNAT != "FullCone" || status.Provenance.Commit != "core-commit" {
 		t.Fatalf("instance status = %s (status %d)", w.Body, w.Code)
 	}
 	if deadline, ok := instance.query.Deadline(); !ok || time.Until(deadline) > 5*time.Second {

@@ -328,6 +328,8 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, 
 	if len(ips) == 1 {
 		return dialContext(ctx, network, ips[0], port, opt)
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	results := make(chan dialResult)
 	returned := make(chan struct{})
 	defer close(returned)

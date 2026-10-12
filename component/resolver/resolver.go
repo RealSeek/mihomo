@@ -154,7 +154,18 @@ func ResolveIPv6(ctx context.Context, host string) (netip.Addr, error) {
 // LookupIPWithResolver same as LookupIP, but with a resolver
 func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
 	if node, ok := DefaultHosts.Search(host, false); ok {
-		return node.IPs, nil
+		if !DisableIPv6 {
+			return node.IPs, nil
+		}
+		ips := make([]netip.Addr, 0, len(node.IPs))
+		for _, ip := range node.IPs {
+			if ip.Is4() {
+				ips = append(ips, ip)
+			}
+		}
+		if len(ips) > 0 {
+			return ips, nil
+		}
 	}
 
 	if r != nil && r.Invalid() {

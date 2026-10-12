@@ -50,6 +50,9 @@ type NodeStatus struct {
 	InstanceID string   `json:"instance-id"`
 	Version    string   `json:"version"`
 	ProxyCIDRs []string `json:"proxy-cidrs"`
+	UDPNAT     string   `json:"udp-nat"`
+	TCPNAT     string   `json:"tcp-nat"`
+	PublicIPs  []string `json:"public-ips,omitempty"`
 }
 
 type PeerStatus struct {
@@ -87,4 +90,7 @@ type RouteStatus struct {
 	ProxyCIDRs                []string `json:"proxy-cidrs"`
 	InstanceID                string   `json:"instance-id"`
 	Version                   string   `json:"version"`
+	UDPNAT                    string   `json:"udp-nat"`
+	TCPNAT                    string   `json:"tcp-nat"`
+	PublicIPs                 []string `json:"public-ips,omitempty"`
 }

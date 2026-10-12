@@ -132,6 +132,8 @@ func (e *EasyTier) instanceStatus(ctx context.Context, instance *corehost.Instan
 	status.Node = &easytier.NodeStatus{
 		PeerID: info.GetPeerId(), Hostname: info.GetHostname(), IPv4: info.GetIpv4Addr(),
 		InstanceID: info.GetInstId(), Version: info.GetVersion(), ProxyCIDRs: info.GetProxyCidrs(),
+		UDPNAT: info.GetStunInfo().GetUdpNatType().String(), TCPNAT: info.GetStunInfo().GetTcpNatType().String(),
+		PublicIPs: info.GetStunInfo().GetPublicIp(),
 	}
 	if ipv6Address.IsValid() {
 		status.Node.IPv6 = ipv6Address.String()
@@ -178,6 +180,8 @@ func (e *EasyTier) instanceStatus(ctx context.Context, instance *corehost.Instan
 			NextHopPeerIDLatencyFirst: route.NextHopPeerIdLatencyFirst, CostLatencyFirst: route.CostLatencyFirst,
 			PathLatencyLatencyFirst: route.PathLatencyLatencyFirst,
 			ProxyCIDRs:              route.GetProxyCidrs(), InstanceID: route.GetInstId(), Version: route.GetVersion(),
+			UDPNAT: route.GetStunInfo().GetUdpNatType().String(), TCPNAT: route.GetStunInfo().GetTcpNatType().String(),
+			PublicIPs: route.GetStunInfo().GetPublicIp(),
 		}
 		if address := route.GetIpv4Addr(); address != nil && address.GetAddress() != nil {
 			ip := easytier.IPv4FromUint32(address.GetAddress().GetAddr())

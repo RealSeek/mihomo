@@ -408,8 +408,7 @@ func TestDatapathReporterStopsOnClose(t *testing.T) {
 	i.stopDatapathReporter()
 }
 
-// TestDatapathReporterSkippedWithoutAStatSource pins the gate: a cgroup-only
-// inbound keeps none of these counters, so it must not pay for a goroutine.
+// An inbound with no prepared data plane must not pay for a report goroutine.
 func TestDatapathReporterSkippedWithoutAStatSource(t *testing.T) {
 	i := &Inbound{}
 	i.startDatapathReporter()
@@ -439,6 +438,7 @@ func TestDatapathReporterGateFollowsTheSourcesItWouldRead(t *testing.T) {
 			i.tcDataPlane = &tcDataPlane{backend: &ECommon.TCBackend{}}
 		}, want: true},
 		{name: "shared rewrite only", build: func(i *Inbound) { i.sharedRewrite = &sharedRewrite{} }, want: true},
+		{name: "cgroup only", build: func(i *Inbound) { i.cgroupBackend = &ECommon.CgroupBackend{} }, want: true},
 		{name: "both", build: func(i *Inbound) {
 			i.tcDataPlane = &tcDataPlane{backend: &ECommon.TCBackend{}}
 			i.sharedRewrite = &sharedRewrite{}
@@ -464,6 +464,7 @@ func TestDatapathStatReadingsLabelEachTCCounterAsItself(t *testing.T) {
 		SKAssignFailed:         2,
 		AssignmentUpdateFailed: 3,
 		DeliveryRewriteFailed:  4,
+		ReturnUpdateFailed:     5, ReturnLookupFailed: 6, ReturnConflict: 7,
 	})
 	got := make(map[datapathStat]uint64, len(readings))
 	for _, reading := range readings {
@@ -474,13 +475,14 @@ func TestDatapathStatReadingsLabelEachTCCounterAsItself(t *testing.T) {
 		datapathStatTCSKAssignFailed:         2,
 		datapathStatTCAssignmentUpdateFailed: 3,
 		datapathStatTCDeliveryRewriteFailed:  4,
+		datapathStatTCReturnUpdateFailed:     5, datapathStatTCReturnLookupFailed: 6, datapathStatTCReturnConflict: 7,
 	} {
 		if got[stat] != want {
 			t.Fatalf("%s reported %d, want %d -- the field and its identity disagree",
 				datapathStatDescriptors[stat].name, got[stat], want)
 		}
 	}
-	if len(readings) != 4 {
-		t.Fatalf("got %d TC readings, want 4", len(readings))
+	if len(readings) != 7 {
+		t.Fatalf("got %d TC readings, want 7", len(readings))
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
 )
 
@@ -52,6 +53,9 @@ var cgroupProgramDefinitions = [cgroupProgramCount]cgroupProgramDefinition{
 }
 
 type cgroupRuntime struct {
+	instanceSlot                *InstanceSlot
+	udpReleaseReader            *ringbuf.Reader
+	udpReleaseFallback          string
 	cgroupFile                  *os.File
 	maps                        map[string]*CiliumEBPF.Map
 	programs                    []*CiliumEBPF.Program
@@ -82,45 +86,47 @@ type cgroupRuntime struct {
 
 	// displaced holds, per slot, the program another owner had attached
 	// exclusively and the exclusive fallback replaced; detach puts it back.
-	displaced [cgroupProgramCount]*CiliumEBPF.Program
+	displaced    [cgroupProgramCount]*displacedCgroupOwner
+	attach_modes [cgroupProgramCount]string
 }
 
 type CgroupBackend struct {
-	access                         sync.RWMutex
-	health                         backendHealth
-	udpRecoveryAccess              sync.Mutex
-	udpReplyTokenSequence          atomic.Uint64
-	connectedUDPTokenLookupSupport mapBatchSupport
-	connectedUDPTokenKeys          []uint64
-	connectedUDPTokenValues        []listenerLookupKey
-	lookupAndDeleteMode            atomic.Int32
-	udpRecoveryConsumeMode         atomic.Int32
-	runtime                        *cgroupRuntime
-	mapCapacity                    CgroupMapCapacity
-	tcpRedirectMapFD               int
-	udpRedirectMapFD               int
-	udpRecoveryMapFD               int
-	udpFlowMapFD                   int
-	socketBypassMapFD              int
-	bypassIPv4CIDRMapFD            int
-	bypassIPv6CIDRMapFD            int
-	hostIPv4MapFD                  int
-	hostIPv6MapFD                  int
-	bypassIPv4CIDR                 []netip.Prefix
-	bypassIPv6CIDR                 []netip.Prefix
-	hostIPv4                       []netip.Prefix
-	hostIPv6                       []netip.Prefix
-	cgroupPath                     string
-	redirectIPv4                   netip.Prefix
-	redirectIPv6                   netip.Prefix
-	fakeIPIPv4                     netip.Prefix
-	fakeIPIPv6                     netip.Prefix
-	enableIPv6                     bool
-	enableUDP                      bool
-	dnsMode                        DNSMode
-	bypassPrivateAddress           bool
-	udpTimeoutSeconds              uint32
-	listenerPort                   uint16
+	maintenance           mapMaintenanceState
+	recoverySweepRemoved  uint32
+	access                sync.RWMutex
+	health                backendHealth
+	udpReleaseReadAccess  sync.Mutex
+	udpReleaseQueueDrops  atomic.Uint64
+	recoverySweepScratch  mapScanScratch[UDPReleaseEvent, originalDestinationValue]
+	udpRecoveryAccess     sync.Mutex
+	udpReplyTokenSequence atomic.Uint64
+	lookupAndDeleteMode   atomic.Int32
+	runtime               *cgroupRuntime
+	mapCapacity           CgroupMapCapacity
+	tcpRedirectMapFD      int
+	udpRedirectMapFD      int
+	udpRecoveryMapFD      int
+	udpFlowMapFD          int
+	socketBypassMapFD     int
+	bypassIPv4CIDRMapFD   int
+	bypassIPv6CIDRMapFD   int
+	hostIPv4MapFD         int
+	hostIPv6MapFD         int
+	bypassIPv4CIDR        []netip.Prefix
+	bypassIPv6CIDR        []netip.Prefix
+	hostIPv4              []netip.Prefix
+	hostIPv6              []netip.Prefix
+	cgroupPath            string
+	redirectIPv4          netip.Prefix
+	redirectIPv6          netip.Prefix
+	fakeIPIPv4            netip.Prefix
+	fakeIPIPv6            netip.Prefix
+	enableIPv6            bool
+	enableUDP             bool
+	dnsMode               DNSMode
+	bypassPrivateAddress  bool
+	udpTimeoutSeconds     uint32
+	listenerPort          uint16
 }
 
 func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
@@ -190,14 +196,39 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	if err != nil {
 		return nil, eBPFOperationError("open cgroup", err)
 	}
-	if err = lockCgroupFile(cgroupFile); err != nil {
+	exclusive, err := lockSharedCgroupFile(cgroupFile)
+	if err != nil {
 		_ = cgroupFile.Close()
 		return nil, err
 	}
-	if err = detachOwnedCgroupPrograms(int(cgroupFile.Fd())); err != nil {
-		_ = cgroupFile.Close()
-		return nil, eBPFOperationError("detach stale cgroup programs", err)
+	if exclusive {
+		if err = detachOwnedCgroupPrograms(int(cgroupFile.Fd())); err != nil {
+			_ = cgroupFile.Close()
+			return nil, err
+		}
+		if err = shareCgroupLock(cgroupFile); err != nil {
+			_ = cgroupFile.Close()
+			return nil, err
+		}
 	}
+	instanceSlot, err := acquireCgroupSlot(cgroupFile)
+	if err != nil {
+		_ = cgroupFile.Close()
+		return nil, err
+	}
+	if !exclusive && !cgroupSharedAcrossNetworkNamespaces(cgroupFile) {
+		if err = detachOwnedCgroupPrograms(int(cgroupFile.Fd()), instanceSlot.Index()); err != nil {
+			_ = instanceSlot.Close()
+			_ = cgroupFile.Close()
+			return nil, err
+		}
+	}
+	keepSlot := false
+	defer func() {
+		if !keepSlot {
+			_ = instanceSlot.Close()
+		}
+	}()
 	socketReleaseSupported := false
 	coarseTimeSupported := false
 	if config.EnableUDP {
@@ -209,6 +240,7 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		}
 	}
 	runtimeState := &cgroupRuntime{
+		instanceSlot:             instanceSlot,
 		cgroupFile:               cgroupFile,
 		maps:                     make(map[string]*CiliumEBPF.Map),
 		programs:                 make([]*CiliumEBPF.Program, cgroupProgramCount),
@@ -223,13 +255,19 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		coarse_time_supported:    coarseTimeSupported,
 	}
 	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries), config.SelfBypassMap); err != nil {
+		if runtimeState.udpReleaseReader != nil {
+			_ = runtimeState.udpReleaseReader.Close()
+		}
 		_ = closeMaps(runtimeState.maps)
 		_ = runtimeState.cgroupFile.Close()
-		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
+		if errors.Is(err, unix.EPERM) {
+			err = explainBPFPermissionError(err, memlockErr)
+		} else if memlockErr != nil && errors.Is(err, unix.ENOMEM) {
 			err = E.Errors(err, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, err
 	}
+	keepSlot = true
 	backend := &CgroupBackend{
 		mapCapacity:          mapCapacity,
 		runtime:              runtimeState,
@@ -254,9 +292,11 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		udpTimeoutSeconds:    udpTimeoutSeconds,
 	}
 	if err = populateCompiledPolicyMaps(policyMapTargets{
-		Scope:     "cgroup eBPF",
-		UID:       runtimeState.maps["cgroup_uid_policy"],
-		LocalPort: runtimeState.maps["cgroup_bypass_port"],
+		LocalForceIPv6: runtimeState.maps["cgroup_local_force_ipv6"],
+		LocalForceIPv4: runtimeState.maps["cgroup_local_force_ipv4"],
+		Scope:          "cgroup eBPF",
+		UID:            runtimeState.maps["cgroup_uid_policy"],
+		LocalPort:      runtimeState.maps["cgroup_bypass_port"],
 	}, policy); err != nil {
 		_ = backend.Close()
 		return nil, err

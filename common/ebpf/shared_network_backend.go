@@ -45,6 +45,7 @@ type sharedNetworkRuntime struct {
 }
 
 type SharedNetworkBackend struct {
+	maintenance         mapMaintenanceState
 	access              sync.RWMutex
 	health              backendHealth
 	flowAccess          sync.Mutex
@@ -55,6 +56,8 @@ type SharedNetworkBackend struct {
 	flowWake            chan struct{}
 	flowSweepAccess     sync.Mutex
 	flowSweepScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
+	flowPurgeScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
+	flowPurgeInterface  uint32
 	flowSweepCandidates []sharedNetworkFlowEntry
 	flowSweepRemoved    uint32
 	runtime             *sharedNetworkRuntime
@@ -170,7 +173,9 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 			verifierErrorStage(err),
 			err,
 		)
-		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
+		if errors.Is(err, unix.EPERM) {
+			prepareErr = explainBPFPermissionError(prepareErr, memlockErr)
+		} else if memlockErr != nil && errors.Is(err, unix.ENOMEM) {
 			prepareErr = E.Errors(prepareErr, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, prepareErr
@@ -241,8 +246,10 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		return nil, err
 	}
 	if err = populateCompiledPolicyMaps(policyMapTargets{
-		Scope:      "shared packet-rewrite",
-		SharedPort: backend.runtime.maps["shared_bypass_port"],
+		SharedForceIPv6: backend.runtime.maps["shared_shared_force_ipv6"],
+		SharedForceIPv4: backend.runtime.maps["shared_shared_force_ipv4"],
+		Scope:           "shared packet-rewrite",
+		SharedPort:      backend.runtime.maps["shared_bypass_port"],
 	}, policy); err != nil {
 		_ = backend.Close()
 		return nil, err
@@ -273,6 +280,8 @@ func prepareSharedNetworkRuntime(
 ) error {
 	var err error
 	runtimeState.maps, err = loadObjectMaps(loadSharedNetwork, map[string]mapSpecOverride{
+		"shared_shared_force_ipv4":   {name: "sb_sh_sforce4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassExcludeEntries, flags: bpfFlagNoPrealloc},
+		"shared_shared_force_ipv6":   {name: "sb_sh_sforce6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassExcludeEntries, flags: bpfFlagNoPrealloc},
 		"shared_control":             {name: "sb_sh_control", mapType: CiliumEBPF.Array, maxEntries: 1},
 		"shared_stats":               {name: "sb_sh_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: sharedNetworkStatCount},
 		"shared_flow_by_original":    {name: "sb_sh_orig", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
@@ -493,8 +502,8 @@ func (b *SharedNetworkBackend) KnownFlowUsage() MapUsage {
 }
 
 // RequestMaintenance wakes the shared flow janitor without introducing a
-// polling interval. It is used to continue bounded scans after a partial map
-// traversal.
+// polling interval. The janitor coalesces requests while a bounded scan or
+// pressure check is already scheduled.
 func (b *SharedNetworkBackend) RequestMaintenance() {
 	if b != nil {
 		b.signalFlowWake()

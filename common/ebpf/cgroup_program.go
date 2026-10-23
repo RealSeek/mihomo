@@ -56,7 +56,7 @@ func (b *CgroupBackend) loadCgroupObjectPrograms() ([]*CiliumEBPF.Program, error
 		}
 		selections = append(selections, programSelection{
 			section: b.cgroupProgramSection(slot),
-			name:    definition.name,
+			name:    cgroupKernelProgramName(definition.name, b.runtime.instanceSlot.Index()),
 		})
 		slots = append(slots, slot)
 	}
@@ -68,6 +68,17 @@ func (b *CgroupBackend) loadCgroupObjectPrograms() ([]*CiliumEBPF.Program, error
 	if err != nil && b.runtime.coarse_time_supported && coarseTimeUnavailable(err) {
 		b.runtime.coarse_time_supported = false
 		loadSpec = loadCgroup
+		loaded, err = loadObjectPrograms(loadSpec, b.runtime.maps, selections)
+	}
+	if err != nil && b.runtime.udpReleaseReader != nil {
+		_ = b.runtime.udpReleaseReader.Close()
+		b.runtime.udpReleaseReader = nil
+		b.runtime.udpReleaseFallback = "ringbuf_program_unavailable"
+		for index, slot := range slots {
+			if slot == cgroupProgramSocketRelease {
+				selections[index].section = "cgroup/sock_release_cookie"
+			}
+		}
 		loaded, err = loadObjectPrograms(loadSpec, b.runtime.maps, selections)
 	}
 	if err != nil {
@@ -156,6 +167,9 @@ func (b *CgroupBackend) cgroupProgramSection(slot int) string {
 		}
 		return "cgroup/recvmsg6"
 	case cgroupProgramSocketRelease:
+		if b.runtime.udpReleaseReader != nil {
+			return "cgroup/sock_release_notify"
+		}
 		return "cgroup/sock_release_cookie"
 	default:
 		return ""

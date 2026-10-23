@@ -6,21 +6,33 @@ import (
 	"syscall"
 )
 
+// maxUnwrapSteps is a runaway guard only; real wrapper chains stay far below it.
+const maxUnwrapSteps = 256
+
 // GetTCPStats unwraps the connection wrappers until a socket is found; nil means the
 // counters are not available for this connection.
 func GetTCPStats(conn net.Conn) *Stats {
-	// one slot per unwrap step, the range is bounded by the array so a cycle cannot spin
-	var seen [32]uintptr
+	stats, _ := GetTCPStatsWithSource(conn)
+	return stats
+}
+
+// GetTCPStatsWithSource also reports the identity of the socket the counters came from,
+// so a sampler can tell repeated reads of the same socket apart; zero means unknown.
+func GetTCPStatsWithSource(conn net.Conn) (*Stats, uint64) {
+	var seenBuf [16]uintptr
+	seen := seenBuf[:0]
 outer:
-	for depth := 0; depth < len(seen); depth++ {
+	for depth := 0; depth < maxUnwrapSteps; depth++ {
+		var id uint64
 		if rv := reflect.ValueOf(conn); rv.Kind() == reflect.Ptr {
 			ptr := rv.Pointer()
-			for i := 0; i < depth; i++ {
-				if seen[i] == ptr {
-					return nil
+			id = uint64(ptr)
+			for _, prev := range seen {
+				if prev == ptr {
+					return nil, 0
 				}
 			}
-			seen[depth] = ptr
+			seen = append(seen, ptr)
 		}
 
 		if sc, ok := conn.(interface {
@@ -28,9 +40,9 @@ outer:
 		}); ok {
 			rawConn, err := sc.SyscallConn()
 			if err != nil {
-				return nil
+				return nil, 0
 			}
-			return readTCPStats(rawConn)
+			return readTCPStats(rawConn), id
 		}
 		if u, ok := conn.(interface{ Upstream() any }); ok {
 			if next, ok2 := u.Upstream().(net.Conn); ok2 {
@@ -62,7 +74,7 @@ outer:
 				}
 			}
 		}
-		return nil
+		return nil, 0
 	}
-	return nil
+	return nil, 0
 }

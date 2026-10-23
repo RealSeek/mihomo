@@ -32,10 +32,14 @@ enum cgroup_protocol_mode {
         .max_entries = 1U, \
     }
 
+MAP(cgroup_local_force_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+MAP(cgroup_local_force_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_control, __u32, struct sb_ebpf_cgroup_control, BPF_MAP_TYPE_ARRAY);
 MAP(cgroup_tcp_redirect, struct sb_ebpf_listener_key, struct sb_ebpf_original_dst, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_redirect, struct sb_ebpf_listener_key, struct sb_ebpf_original_dst, BPF_MAP_TYPE_HASH);
+MAP(cgroup_udp_recovery_value, struct sb_ebpf_udp_recovery_key, struct sb_ebpf_original_dst, BPF_MAP_TYPE_LRU_HASH);
 MAP(cgroup_udp_recovery, struct sb_ebpf_listener_key, struct sb_ebpf_original_dst, BPF_MAP_TYPE_LRU_HASH);
+MAP(cgroup_udp_token_reverse, struct sb_ebpf_listener_key, __u64, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_token, __u64, struct sb_ebpf_listener_key, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_peer, struct sb_ebpf_udp_peer_key, struct sb_ebpf_udp_peer_value, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_flow, struct sb_ebpf_udp_flow_key, struct sb_ebpf_udp_flow_value, BPF_MAP_TYPE_LRU_HASH);
@@ -46,6 +50,12 @@ MAP(cgroup_bypass_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM
 MAP(cgroup_bypass_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_host_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_HASH);
 MAP(cgroup_host_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_HASH);
+MAP(cgroup_udp_release_stats, __u32, __u64, BPF_MAP_TYPE_PERCPU_ARRAY);
+struct bpf_map_def SEC("maps") cgroup_udp_release_events = {
+    .type = BPF_MAP_TYPE_RINGBUF, .max_entries = 65536U,
+};
+static long (*ringbuf_output)(void *ringbuf, void *data, __u64 size, __u64 flags) =
+    (void *)BPF_FUNC_ringbuf_output;
 static void *(*map_lookup)(void *map, const void *key) = (void *)BPF_FUNC_map_lookup_elem;
 static long (*map_update)(void *map, const void *key, const void *value, __u64 flags) =
     (void *)BPF_FUNC_map_update_elem;
@@ -65,8 +75,20 @@ INLINE __u64 flow_time_ns(void) {
 #endif
 }
 
-INLINE __u16 swap16(__u16 value) { return __builtin_bswap16(value); }
-INLINE __u32 swap32(__u32 value) { return __builtin_bswap32(value); }
+INLINE __u16 swap16(__u16 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap16(value);
+#else
+    return value;
+#endif
+}
+INLINE __u32 swap32(__u32 value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap32(value);
+#else
+    return value;
+#endif
+}
 
 INLINE const struct sb_ebpf_cgroup_control *control(void) {
     __u32 key = 0U;
@@ -137,10 +159,21 @@ INLINE bool host_ipv6(const __u32 address[4]) {
     return map_lookup(&cgroup_host_ipv6, &key) != 0;
 }
 
+INLINE bool local_force_v4(const __u8 destination[4]) {
+    struct sb_ebpf_ipv4_cidr_lpm_key key = {.prefixlen = 32U};
+    __builtin_memcpy(key.addr, destination, 4U);
+    return map_lookup(&cgroup_local_force_ipv4, &key) != 0;
+}
+
+INLINE bool local_force_v6(const __u8 destination[16]) {
+    struct sb_ebpf_ipv6_cidr_lpm_key key = {.prefixlen = 128U};
+    __builtin_memcpy(key.addr, destination, 16U);
+    return map_lookup(&cgroup_local_force_ipv6, &key) != 0;
+}
+
 INLINE bool base_bypass(__u64 cookie, const struct sb_ebpf_cgroup_control *config, __u8 protocol, __u16 port) {
     if (is_cookie_bypassed(cookie)) return true;
     if (service_port(protocol, port)) return true;
-    if (port_bypassed(config, protocol, port)) return true;
     return false;
 }
 
@@ -247,6 +280,8 @@ INLINE bool token_v6(
         __builtin_memcpy(key->token_addr, config->redirect_ipv6_prefix, 8U);
         __builtin_memcpy(key->token_addr + 8U, &seed0, 4U);
         __builtin_memcpy(key->token_addr + 12U, &seed1, 4U);
+        key->token_addr[8] = SB_EBPF_IPV6_TOKEN_MARKER0;
+        key->token_addr[9] = SB_EBPF_IPV6_TOKEN_MARKER1;
         if (protocol == TCP_VALUE) {
             struct sb_ebpf_original_dst *existing = map_lookup(&cgroup_tcp_redirect, key);
             if (existing != 0 && equal_original(existing, value)) return true;
@@ -287,10 +322,38 @@ INLINE bool rewrite_v4_mapped(struct bpf_sock_addr *ctx, const struct sb_ebpf_li
     __builtin_memcpy(&address, key->token_addr, sizeof(address));
     *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
     *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
-    *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+    *(volatile __u32 *)&ctx->user_ip6[2] = swap32(0x0000ffffU);
     *(volatile __u32 *)&ctx->user_ip6[3] = address;
     ctx->user_port = swap16(key->listener_port);
     return true;
+}
+
+_Static_assert(__builtin_offsetof(struct sb_ebpf_udp_flow_key, family) % sizeof(__u32) == 0U &&
+        __builtin_offsetof(struct sb_ebpf_udp_flow_key, addr) -
+                __builtin_offsetof(struct sb_ebpf_udp_flow_key, family) ==
+            __builtin_offsetof(struct sb_ebpf_original_dst, addr) &&
+        __builtin_offsetof(struct sb_ebpf_original_dst, flags) == 20U,
+    "UDP flow key and original destination must share the destination layout");
+
+// A cached proxy decision holds only while the redirect entry it names still
+// records this socket's destination. Without socket-release support that map
+// is an LRU, and nothing else looks the entry up while the cache answers, so
+// the busiest flows would be evicted first and a later flow could claim the
+// token. The lookup also keeps the entry recently used.
+INLINE bool flow_redirect_current(
+    const struct sb_ebpf_udp_flow_key *key,
+    const struct sb_ebpf_listener_key *listener) {
+    const struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, listener);
+    if (original == 0 || original->socket_cookie != key->cookie) return false;
+    // family, protocol, port and address, then flags and reserved bytes, which
+    // are zero for the unconnected sends that this cache serves.
+    const __u32 *expected = (const __u32 *)&key->family;
+    const __u32 *actual = (const __u32 *)original;
+#pragma clang loop unroll(full)
+    for (__u32 index = 0U; index < 5U; ++index) {
+        if (expected[index] != actual[index]) return false;
+    }
+    return actual[5] == 0U;
 }
 
 INLINE int flow_action(
@@ -322,6 +385,10 @@ INLINE int flow_action(
     if (flow->last_seen_seconds != now) flow->last_seen_seconds = now;
     if (flow->action == SB_EBPF_UDP_FLOW_ACTION_BYPASS) return FLOW_CACHE_BYPASS;
     if (flow->action == SB_EBPF_UDP_FLOW_ACTION_PROXY) {
+        if (!flow_redirect_current(&flow_key, &flow->listener)) {
+            map_delete(&cgroup_udp_flow, &flow_key);
+            return FLOW_CACHE_MISS;
+        }
         if (mapped_context) rewrite_v4_mapped(ctx, &flow->listener);
         else if (family == AF_INET_VALUE) rewrite_v4(ctx, &flow->listener);
         else rewrite_v6(ctx, &flow->listener);
@@ -372,9 +439,28 @@ INLINE void reset_connected_udp(__u64 cookie) {
         struct sb_ebpf_listener_key listener;
         __builtin_memcpy(&listener, current, sizeof(listener));
         map_delete(&cgroup_udp_redirect, &listener);
+        map_delete(&cgroup_udp_token_reverse, &listener);
     }
     map_delete(&cgroup_udp_token, &cookie);
     map_delete(&cgroup_udp_peer, &cookie);
+}
+
+// Tokens are scoped to this backend's maps. Verify the forward association in
+// userspace too, since independent LRU eviction can leave a stale reverse key.
+INLINE bool store_connected_udp_token(__u64 cookie, const struct sb_ebpf_listener_key *listener) {
+    if (cookie == 0U) return false;
+    __u64 *previous = map_lookup(&cgroup_udp_token_reverse, listener);
+    if (previous != 0 && *previous != cookie) {
+        __u64 previous_cookie = *previous;
+        map_delete(&cgroup_udp_token, &previous_cookie);
+        map_delete(&cgroup_udp_peer, &previous_cookie);
+    }
+    if (map_update(&cgroup_udp_token, &cookie, listener, 0U) != 0) return false;
+    if (map_update(&cgroup_udp_token_reverse, listener, &cookie, 0U) != 0) {
+        map_delete(&cgroup_udp_token, &cookie);
+        return false;
+    }
+    return true;
 }
 
 INLINE void store_udp_peer_v4(__u64 cookie, __u32 address, __u16 port) {
@@ -432,7 +518,7 @@ INLINE bool restore_udp_peer_for_empty_v6(
     if (peer->family == AF_INET_VALUE) {
         address[0] = 0U;
         address[1] = 0U;
-        address[2] = 0xffff0000U;
+        address[2] = swap32(0x0000ffffU);
         __builtin_memcpy(&address[3], peer->addr, sizeof(address[3]));
     } else if (peer->family == AF_INET6_VALUE) {
         __builtin_memcpy(address, peer->addr, sizeof(peer->addr));
@@ -474,7 +560,6 @@ INLINE int handle_v4(
     }
     bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
     bool intercept_dns = port == 53U && config->dns_mode != SB_EBPF_DNS_MODE_OFF;
-    if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
     if (connected_udp) {
         reset_connected_udp(cookie);
         store_udp_peer_v4(cookie, destination, port);
@@ -489,6 +574,10 @@ INLINE int handle_v4(
         SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4,
         config->fakeip_ipv4_prefix,
         config->fakeip_ipv4_mask);
+    bool force_exclude = local_force_v4(destination_bytes);
+    if (!force_exclude && (port_bypassed(config, protocol, port) ||
+        (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF))) return 1;
+    force_fakeip = force_fakeip || force_exclude;
     // UID policy belongs to the task sending, not to the socket, so it goes
     // ahead of the UDP flow cache: a socket that a bypassed UID inherited or
     // shares must not reuse the proxy decision cached for an earlier sender. A
@@ -520,7 +609,7 @@ INLINE int handle_v4(
     original_v4(&original, protocol, port, destination, cookie, connected_udp);
     if (!token_v4(config, &listener, &original, destination, protocol, cookie)) return 0;
     if (connected_udp) {
-        if (cookie == 0U || map_update(&cgroup_udp_token, &cookie, &listener, 0U) != 0) {
+        if (!store_connected_udp_token(cookie, &listener)) {
             map_delete(&cgroup_udp_redirect, &listener);
             return 0;
         }
@@ -571,7 +660,6 @@ INLINE int handle_v6(
         }
         bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
         bool intercept_dns = port == 53U && config->dns_mode != SB_EBPF_DNS_MODE_OFF;
-        if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
         if (connected_udp) {
             reset_connected_udp(cookie);
             store_udp_peer_v4(cookie, destination, port);
@@ -586,6 +674,10 @@ INLINE int handle_v6(
             SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4,
             config->fakeip_ipv4_prefix,
             config->fakeip_ipv4_mask);
+        bool force_exclude = local_force_v4(destination_bytes);
+        if (!force_exclude && (port_bypassed(config, protocol, port) ||
+            (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF))) return 1;
+        force_fakeip = force_fakeip || force_exclude;
         // UID policy goes ahead of the UDP flow cache and yields to fake-ip; see
         // handle_v4.
         if (!force_dns && !force_fakeip && uid_bypassed(config)) return 1;
@@ -614,7 +706,7 @@ INLINE int handle_v6(
         original_v4(&original, protocol, port, destination, cookie, connected_udp);
         if (!token_v4(config, &listener, &original, destination, protocol, cookie)) return 0;
         if (connected_udp &&
-            (cookie == 0U || map_update(&cgroup_udp_token, &cookie, &listener, 0U) != 0)) {
+            !store_connected_udp_token(cookie, &listener)) {
             map_delete(&cgroup_udp_redirect, &listener);
             return 0;
         }
@@ -631,9 +723,9 @@ INLINE int handle_v6(
             (void)restore_udp_peer_v6(cookie, address, &port);
         }
     }
+    if (sb_ebpf_ipv6_redirect_token((const __u8 *)address)) return 1;
     bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
     bool intercept_dns = port == 53U && config->dns_mode != SB_EBPF_DNS_MODE_OFF;
-    if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
     if (connected_udp) {
         reset_connected_udp(cookie);
         store_udp_peer_v6(cookie, address, port);
@@ -646,6 +738,10 @@ INLINE int handle_v6(
         SB_EBPF_CGROUP_FLAG_FAKEIP_IPV6,
         config->fakeip_ipv6_prefix,
         config->fakeip_ipv6_mask);
+    bool force_exclude = local_force_v6((const __u8 *)address);
+    if (!force_exclude && (port_bypassed(config, protocol, port) ||
+        (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF))) return 1;
+    force_fakeip = force_fakeip || force_exclude;
     // UID policy goes ahead of the UDP flow cache and yields to fake-ip; see
     // handle_v4.
     if (!force_dns && !force_fakeip && uid_bypassed(config)) return 1;
@@ -674,7 +770,7 @@ INLINE int handle_v6(
     original_v6(&original, protocol, port, address, cookie, connected_udp);
     if (!token_v6(config, &listener, &original, address, protocol, cookie)) return 0;
     if (connected_udp &&
-        (cookie == 0U || map_update(&cgroup_udp_token, &cookie, &listener, 0U) != 0)) {
+        !store_connected_udp_token(cookie, &listener)) {
         map_delete(&cgroup_udp_redirect, &listener);
         return 0;
     }
@@ -735,7 +831,7 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx, bool enable_native_ipv6) {
         __builtin_memcpy(&original_address, original->addr, sizeof(original_address));
         *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
         *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
-        *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+        *(volatile __u32 *)&ctx->user_ip6[2] = swap32(0x0000ffffU);
         *(volatile __u32 *)&ctx->user_ip6[3] = original_address;
         ctx->user_port = swap16(original->port);
         return 1;
@@ -764,14 +860,30 @@ SEC("cgroup/recvmsg4") int sb_ebpf_urcv4_c(struct bpf_sock_addr *ctx) { return r
 SEC("cgroup/recvmsg6") int sb_ebpf_urcv6_c(struct bpf_sock_addr *ctx) { return recv_v6(ctx, true); }
 SEC("cgroup/recvmsg6_mapped") int sb_ebpf_urcv6_mapped_c(struct bpf_sock_addr *ctx) { return recv_v6(ctx, false); }
 
-INLINE int release_socket(struct bpf_sock *ctx) {
+INLINE int release_socket(struct bpf_sock *ctx, bool notify) {
     __u64 cookie = get_socket_cookie(ctx);
     if (cookie == 0U) return 1;
     struct sb_ebpf_listener_key *listener = map_lookup(&cgroup_udp_token, &cookie);
     if (listener != 0) {
         struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, listener);
-        if (original != 0) map_update(&cgroup_udp_recovery, listener, original, 0U);
+        if (original != 0) {
+            struct sb_ebpf_original_dst recovery = *original;
+            recovery.created_at_ns = ktime_get_ns();
+            struct sb_ebpf_udp_recovery_key identity = {
+                .socket_cookie = recovery.socket_cookie,
+                .released_at_ns = recovery.created_at_ns,
+            };
+            if (map_update(&cgroup_udp_recovery_value, &identity, &recovery, 0U) == 0) {
+                map_update(&cgroup_udp_recovery, listener, &recovery, 0U);
+                if (notify && ringbuf_output(&cgroup_udp_release_events, &identity, sizeof(identity), 0U) != 0) {
+                    __u32 zero = 0;
+                    __u64 *drops = map_lookup(&cgroup_udp_release_stats, &zero);
+                    if (drops != 0) *drops += 1U;
+                }
+            }
+        }
         map_delete(&cgroup_udp_redirect, listener);
+        map_delete(&cgroup_udp_token_reverse, listener);
         map_delete(&cgroup_udp_token, &cookie);
     }
     map_delete(&cgroup_udp_peer, &(__u64){cookie});
@@ -779,6 +891,8 @@ INLINE int release_socket(struct bpf_sock *ctx) {
     return 1;
 }
 
-SEC("cgroup/sock_release_cookie") int sb_ebpf_rel_cookie(struct bpf_sock *ctx) { return release_socket(ctx); }
+SEC("cgroup/sock_release_cookie") int sb_ebpf_rel_cookie(struct bpf_sock *ctx) { return release_socket(ctx, false); }
+
+SEC("cgroup/sock_release_notify") int sb_ebpf_rel_notify(struct bpf_sock *ctx) { return release_socket(ctx, true); }
 
 char _license[] SEC("license") = "GPL";

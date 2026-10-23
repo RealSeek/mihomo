@@ -60,6 +60,13 @@ struct sb_ebpf_listener_key {
     __u8 token_addr[16];
 };
 
+// Immutable recovery identity: delayed expiry cannot delete a reused token.
+struct sb_ebpf_udp_recovery_key {
+    __u64 socket_cookie;
+    __u64 released_at_ns;
+};
+_Static_assert(sizeof(struct sb_ebpf_udp_recovery_key) == 16U, "UDP recovery key ABI");
+
 struct sb_ebpf_original_dst {
     __u8 family;
     __u8 protocol;
@@ -142,7 +149,10 @@ _Static_assert(sizeof(struct sb_ebpf_udp_flow_value) == 32U, "unexpected UDP flo
 // -- a leak rather than a stall, and the one counter here that a firewall or a
 // capture would not explain.
 #define SB_TC_STAT_DELIVERY_REWRITE_FAILED 3U
-#define SB_TC_STAT_COUNT 4U
+#define SB_TC_STAT_RETURN_UPDATE_FAILED 4U
+#define SB_TC_STAT_RETURN_CONFLICT 5U
+#define SB_TC_STAT_RETURN_LOOKUP_FAILED 6U
+#define SB_TC_STAT_COUNT 7U
 
 // The keys index a fixed-size array map, so a reorder would silently re-label a
 // counter on the Go side rather than fail to build. Pin each key's value, not
@@ -152,7 +162,7 @@ _Static_assert(SB_TC_STAT_LISTENER_SOCKET_MISSING == 0U, "TC stat ABI reordered"
 _Static_assert(SB_TC_STAT_SK_ASSIGN_FAILED == 1U, "TC stat ABI reordered");
 _Static_assert(SB_TC_STAT_ASSIGNMENT_UPDATE_FAILED == 2U, "TC stat ABI reordered");
 _Static_assert(SB_TC_STAT_DELIVERY_REWRITE_FAILED == 3U, "TC stat ABI reordered");
-_Static_assert(SB_TC_STAT_COUNT == 4U, "unexpected TC datapath stat ABI");
+_Static_assert(SB_TC_STAT_COUNT == 7U, "unexpected TC datapath stat ABI");
 
 struct sb_ebpf_uid_lpm_key {
     __u32 prefixlen;

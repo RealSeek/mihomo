@@ -31,6 +31,8 @@
         .max_entries = entries, \
     }
 
+EXTERNAL_MAP(shared_shared_force_ipv4, struct sb_lpm4_key, __u8, 4096U);
+EXTERNAL_MAP(shared_shared_force_ipv6, struct sb_lpm6_key, __u8, 4096U);
 EXTERNAL_MAP(shared_control, __u32, struct sb_shared_control, 1U);
 struct bpf_map_def SEC("maps") shared_stats = {
     .type = BPF_MAP_TYPE_PERCPU_ARRAY,
@@ -76,6 +78,10 @@ static long (*l3_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, 
     (void *)BPF_FUNC_l3_csum_replace;
 static long (*l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) =
     (void *)BPF_FUNC_l4_csum_replace;
+static long (*skb_load_bytes)(const struct __sk_buff *skb, __u32 offset, void *to, __u32 length) =
+    (void *)BPF_FUNC_skb_load_bytes;
+static long (*skb_store_bytes)(struct __sk_buff *skb, __u32 offset, const void *from, __u32 length, __u64 flags) =
+    (void *)BPF_FUNC_skb_store_bytes;
 INLINE void record_shared_stat(__u32 key) {
     __u64 *counter = map_lookup(&shared_stats, &key);
     if (counter != 0) *counter += 1U;
@@ -95,11 +101,19 @@ INLINE void refresh_activity_timestamp(__u64 *last_seen_ns, __u64 now) {
 }
 
 INLINE __u16 swap16(__u16 value) {
+    #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     return __builtin_bswap16(value);
+#else
+    return value;
+#endif
 }
 
 INLINE __u32 swap32(__u32 value) {
+    #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     return __builtin_bswap32(value);
+#else
+    return value;
+#endif
 }
 
 INLINE void copy_address(__u8 destination[16], const __u8 source[16], __u32 size) {
@@ -161,6 +175,9 @@ NOINLINE int ingress_ipv4(
     __builtin_memcpy(scratch->original.original_addr, &ip->destination, 4U);
     __u8 dns_policy = shared_dns_policy(
         ip->protocol, source_port, destination_port, control);
+    if (!dhcp_packet(scratch->original.protocol, source_port, destination_port) &&
+        !sb_ebpf_ipv4_safety_bypass(scratch->original.original_addr) &&
+        shared_force_v4(scratch->original.original_addr)) dns_policy = SB_SHARED_POLICY_PROXY;
     if (dns_policy == SB_SHARED_POLICY_BYPASS) {
         return SB_SHARED_ACT_CONTINUE;
     }
@@ -405,6 +422,9 @@ NOINLINE int ingress_ipv6(
     __builtin_memcpy(scratch->original.original_addr, ip->destination, 16U);
     __u8 dns_policy = shared_dns_policy(
         protocol, source_port, destination_port, control);
+    if (!dhcp_packet(scratch->original.protocol, source_port, destination_port) &&
+        !sb_ebpf_ipv6_safety_bypass(scratch->original.original_addr) &&
+        shared_force_v6(scratch->original.original_addr)) dns_policy = SB_SHARED_POLICY_PROXY;
     if (dns_policy == SB_SHARED_POLICY_BYPASS) {
         return SB_SHARED_ACT_CONTINUE;
     }
@@ -565,12 +585,40 @@ NOINLINE int egress_ipv6(
         protocol);
 }
 
+// Drivers that build received packets in page fragments (napi_gro_frags users
+// such as mlx4, sfc and gve, or any device with GRO off) can leave headers GRO
+// did not parse, such as a UDP header, outside the linear area that direct
+// packet access reads; ingress would then drop the packet as truncated. The
+// pull covers the longest header layout parsed before the transport ports and
+// happens before anything is parsed: a packet value kept across the helper
+// call loses its bounds on verifiers before Linux 5.10, which then walk the
+// rewrite path once per side of the pull and exceed the 4.19 complexity limit.
+// A packet whose first bytes are linear, including every short linear packet,
+// only pays the compare.
+#define SB_SHARED_PULL_LENGTH (sizeof(struct ethernet_header) + 2U * sizeof(struct vlan_header) + \
+    sizeof(struct ipv6_header) + sizeof(struct udp_header_min))
+
+// Volatile so that both sides of the pull load the pointers again after it
+// and reach the parser in the same verifier state.
+#define SKB_DATA(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data)
+#define SKB_DATA_END(skb) ((void *)(long)*(volatile __u32 *)&(skb)->data_end)
+
+INLINE void pull_headers(struct __sk_buff *skb, __u32 length) {
+    __u32 available = skb->len;
+    if (available < length) length = available;
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    if (data + length <= data_end) return;
+    (void)skb_pull_data(skb, length);
+}
+
 NOINLINE int classify_ingress(struct __sk_buff *skb) {
     __u32 zero = 0U;
     struct sb_shared_control *control = map_lookup(&shared_control, &zero);
     if (control == 0 || control->enabled == 0U) return SB_SHARED_ACT_CONTINUE;
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+    pull_headers(skb, SB_SHARED_PULL_LENGTH);
+    void *data = SKB_DATA(skb);
+    void *data_end = SKB_DATA_END(skb);
     struct ethernet_header *ethernet = data;
     if ((void *)(ethernet + 1) > data_end) return SB_SHARED_ACT_CONTINUE;
     __u16 protocol = swap16(ethernet->protocol);

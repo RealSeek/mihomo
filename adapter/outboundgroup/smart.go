@@ -24,8 +24,10 @@ import (
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
+	"github.com/metacubex/mihomo/common/lru"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/singleflight"
+	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/mmdb"
@@ -59,6 +61,11 @@ const (
 	deterministicDialPrefix = 3
 	parallelDials           = 5
 	connectThreshold        = 5.0
+
+	smartStickyCacheAge  = 10 * time.Minute
+	smartStickyCacheSize = 1000
+
+	smartStrategyStickySessions = "sticky-sessions"
 
 	floodWindow    = 2 * time.Second
 	floodThreshold = 50
@@ -103,6 +110,8 @@ const (
 
 type SmartOption struct {
 	PolicyPriority string  `group:"policy-priority,omitempty"`
+	TypePriority   string  `group:"type-priority,omitempty"`
+	Strategy       string  `group:"strategy,omitempty"`
 	UseLightGBM    bool    `group:"uselightgbm,omitempty"`
 	CollectData    bool    `group:"collectdata,omitempty"`
 	SampleRate     float64 `group:"sample-rate,omitempty"`
@@ -122,6 +131,8 @@ type Smart struct {
 
 	configName     string
 	selected       string
+	strategy       string
+	stickyCache    *lru.LruCache[uint64, string]
 	testUrl        string
 	testUrlHost    string
 	expectedStatus string
@@ -129,6 +140,7 @@ type Smart struct {
 
 	weightModel    *lightgbm.WeightModel
 	policyPriority []priorityRule
+	typePriority   map[string]float64
 	priorityCache  xsync.Map[string, float64]
 	sampleRate     float64
 	useLightGBM    bool
@@ -214,6 +226,13 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	configFile := C.Path.Config()
 	configName := strings.TrimSuffix(filepath.Base(configFile), filepath.Ext(configFile))
 
+	strategy := strings.TrimSpace(smartOption.Strategy)
+	switch strategy {
+	case "", smartStrategyStickySessions:
+	default:
+		return nil, fmt.Errorf("%w: smart strategy %q", errStrategy, smartOption.Strategy)
+	}
+
 	s := &Smart{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:             option.Name,
@@ -234,8 +253,10 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,
 		configName:     configName,
+		strategy:       strategy,
 		disableUDP:     option.DisableUDP,
 		policyPriority: make([]priorityRule, 0),
+		typePriority:   make(map[string]float64),
 		sampleRate:     1,
 		useLightGBM:    smartOption.UseLightGBM,
 		collectData:    smartOption.CollectData,
@@ -247,12 +268,23 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	s.hostFailLimit.Store(int32(s.maxFailedTimes))
 	s.testUrlHost = testUrlHostOf(s.testUrl)
 
+	if strategy == smartStrategyStickySessions {
+		s.stickyCache = lru.New[uint64, string](
+			lru.WithAge[uint64, string](int64(smartStickyCacheAge.Seconds())),
+			lru.WithSize[uint64, string](smartStickyCacheSize),
+		)
+	}
+
 	if smartOption.SampleRate > 0 && smartOption.SampleRate <= 1 {
 		s.sampleRate = smartOption.SampleRate
 	}
 
 	if smartOption.PolicyPriority != "" {
 		s.applyPolicyPriority(smartOption.PolicyPriority)
+	}
+
+	if smartOption.TypePriority != "" {
+		s.applyTypePriority(smartOption.TypePriority)
 	}
 
 	s.InitSmart()
@@ -305,6 +337,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			} else {
 				if !keepPin {
 					s.adoptUnwrapWinner(metadata, p)
+					s.storeStickyProxy(metadata, p)
 				}
 				s.onDialSuccess()
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
@@ -312,6 +345,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		}
 
 		s.store.DeleteUnwrapResult(s.Name(), s.configName, s.unwrapKey(metadata))
+		s.clearStickyProxy(metadata)
 
 		s.groupDialFailed(proxies, finalErr)
 
@@ -363,6 +397,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 
 			if !keepPin {
 				s.adoptUnwrapWinner(metadata, proxy)
+				s.storeStickyProxy(metadata, proxy)
 			}
 			s.onDialSuccess()
 			return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
@@ -374,6 +409,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	}
 
 	s.store.DeleteUnwrapResult(s.Name(), s.configName, s.unwrapKey(metadata))
+	s.clearStickyProxy(metadata)
 
 	s.groupDialFailed(proxies, finalErr)
 
@@ -704,6 +740,21 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		fmt.Fprintf(&policyPriorityBuf, "%s:%.2f", rule.pattern, rule.factor)
 	}
 
+	var typePriorityBuf strings.Builder
+	if len(s.typePriority) > 0 {
+		types := make([]string, 0, len(s.typePriority))
+		for proxyType := range s.typePriority {
+			types = append(types, proxyType)
+		}
+		sort.Strings(types)
+		for i, proxyType := range types {
+			if i > 0 {
+				typePriorityBuf.WriteByte(';')
+			}
+			fmt.Fprintf(&typePriorityBuf, "%s:%.2f", proxyType, s.typePriority[proxyType])
+		}
+	}
+
 	return json.Marshal(map[string]any{
 		"type":            s.Type().String(),
 		"now":             s.Now(),
@@ -715,6 +766,8 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		"icon":            s.Icon(),
 		"emptyFallback":   s.EmptyFallback().Name(),
 		"policy-priority": policyPriorityBuf.String(),
+		"type-priority":   typePriorityBuf.String(),
+		"strategy":        s.strategy,
 		"useLightGBM":     s.useLightGBM,
 		"collectData":     s.collectData,
 		"sampleRate":      s.sampleRate,
@@ -729,6 +782,69 @@ func (s *Smart) Providers() []provider.ProxyProvider {
 
 func (s *Smart) Proxies() []C.Proxy {
 	return s.GetProxies(false)
+}
+
+// smartStickyKey pins one destination per source: a router or hotspot shares a
+// single process between clients, so the source address is what keeps two
+// clients on their own nodes for the same site.
+func smartStickyKey(metadata *C.Metadata, wildcardTarget string) uint64 {
+	src := ""
+	if metadata.SrcIP.IsValid() {
+		src = metadata.SrcIP.String()
+	}
+	return utils.MapHash(src + "\x00" + wildcardTarget)
+}
+
+// stickyProxy returns the node a sticky-sessions target is already using. Only
+// evidence against the node drops the pin: it left the group, is blocked, failed
+// for this host, is dead for the test URL, or cannot carry the network. A newer
+// best node or a lower weight is exactly what stickiness is meant to ignore.
+func (s *Smart) stickyProxy(metadata *C.Metadata, wildcardTarget string, proxies []C.Proxy, isUDP bool) C.Proxy {
+	if s.strategy != smartStrategyStickySessions || s.stickyCache == nil {
+		return nil
+	}
+
+	key := smartStickyKey(metadata, wildcardTarget)
+	name, ok := s.stickyCache.Get(key)
+	if !ok || name == "" {
+		return nil
+	}
+
+	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
+	lookupTarget, extraTargets := failLookupTargets(metadata, isUDP)
+	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, lookupTarget, int(s.hostFailLimit.Load()), extraTargets...)
+
+	for _, p := range proxies {
+		if p.Name() != name {
+			continue
+		}
+		if blockedNodes[name] || excludedForHost(wtFailNodes, wtBlocked, name) ||
+			!p.AliveForTestUrl(s.testUrl) || (isUDP && !p.SupportUDP()) {
+			break
+		}
+		return p
+	}
+
+	s.stickyCache.Delete(key)
+	return nil
+}
+
+func (s *Smart) storeStickyProxy(metadata *C.Metadata, p C.Proxy) {
+	if s.strategy != smartStrategyStickySessions || s.stickyCache == nil {
+		return
+	}
+	// a manual member selection is a choice the user made, not a session to keep
+	if s.selected != "" {
+		return
+	}
+	s.stickyCache.Set(smartStickyKey(metadata, metadata.WildcardTarget), p.Name())
+}
+
+func (s *Smart) clearStickyProxy(metadata *C.Metadata) {
+	if s.strategy != smartStrategyStickySessions || s.stickyCache == nil {
+		return
+	}
+	s.stickyCache.Delete(smartStickyKey(metadata, metadata.WildcardTarget))
 }
 
 func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) ([]C.Proxy, bool) {
@@ -788,7 +904,7 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		return selected[:minCount], softSkipped
 	}
 
-	hasPriority := len(s.policyPriority) > 0
+	hasPriority := len(s.policyPriority) > 0 || len(s.typePriority) > 0
 
 	type sortKey struct {
 		delay     uint16
@@ -809,7 +925,7 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 			suspected: s.exitWatch.Suspected(wildcardTarget, p.Name()),
 		}
 		if hasPriority {
-			key.factor = s.getPriorityFactor(p.Name())
+			key.factor = s.getPriorityFactor(p)
 		}
 		ranked[i] = keyedProxy{proxy: p, key: key}
 	}
@@ -972,6 +1088,11 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 		}
 	}
 
+	isUDP := metadata.NetWork == C.UDP
+	if p := s.stickyProxy(metadata, wildcardTarget, proxies, isUDP); p != nil {
+		return []C.Proxy{p}, true, false
+	}
+
 	computeFreshNodes := func(isUDP bool) ([]string, []float64) {
 		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, isUDP); len(proxiesName) > 0 {
 			return proxiesName, weights
@@ -1026,7 +1147,6 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 		return names, weights, false
 	}
 
-	isUDP := metadata.NetWork == C.UDP
 	resultNames, resultWeights, pinned := trySelector(isUDP)
 
 	// a pin that cannot serve this network leaves it to the other one, so the candidates are
@@ -1042,8 +1162,9 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 	return filtered, pinned, pinned && softSkipped
 }
 
-func (s *Smart) getPriorityFactor(proxyName string) float64 {
-	if len(s.policyPriority) == 0 {
+func (s *Smart) getPriorityFactor(proxy C.Proxy) float64 {
+	proxyName := proxy.Name()
+	if len(s.policyPriority) == 0 && len(s.typePriority) == 0 {
 		return 1.0
 	}
 	if v, ok := s.priorityCache.Load(proxyName); ok {
@@ -1059,6 +1180,13 @@ func (s *Smart) getPriorityFactor(proxyName string) float64 {
 		} else if strings.Contains(proxyName, rule.pattern) {
 			factor = rule.factor
 			break
+		}
+	}
+	// the type weight multiplies the name weight: a subscription prefix says how
+	// good the line is, the protocol says how well it survives the traffic
+	if len(s.typePriority) > 0 {
+		if typeFactor, ok := s.typePriority[strings.ToLower(proxy.Type().String())]; ok {
+			factor *= typeFactor
 		}
 	}
 	s.priorityCache.Store(proxyName, factor)
@@ -1144,6 +1272,53 @@ func (s *Smart) applyPolicyPriority(policyPriority string) {
 
 		s.policyPriority = append(s.policyPriority, rule)
 	}
+}
+
+// applyTypePriority parses "type:factor;..." weights. The type is the lower-case
+// form of the adapter type, the same string a subscription uses for the proxy's
+// type field (ss/shadowsocks, vless, vmess, hysteria2, ...), so the names do not
+// need a second mapping table.
+func (s *Smart) applyTypePriority(typePriority string) {
+	if s.typePriority == nil {
+		s.typePriority = make(map[string]float64)
+	}
+	for _, pair := range strings.Split(typePriority, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+
+		idx := strings.LastIndex(pair, ":")
+		if idx <= 0 || idx == len(pair)-1 {
+			log.Warnln("[Smart] Invalid type-priority rule: [%s], must be in 'type:factor' format", pair)
+			continue
+		}
+
+		proxyType := normalizeProxyType(pair[:idx])
+		factor, err := strconv.ParseFloat(strings.TrimSpace(pair[idx+1:]), 64)
+		if err != nil {
+			log.Warnln("[Smart] Invalid type-priority factor for type [%s]: %v", proxyType, err)
+			continue
+		}
+		if factor <= 0 {
+			log.Warnln("[Smart] Invalid type-priority factor [%.2f] for type [%s], factor must be positive", factor, proxyType)
+			continue
+		}
+		s.typePriority[proxyType] = factor
+	}
+}
+
+func normalizeProxyType(raw string) string {
+	proxyType := strings.ToLower(strings.TrimSpace(raw))
+	switch proxyType {
+	case "ss":
+		return "shadowsocks"
+	case "ssr":
+		return "shadowsocksr"
+	case "gost-relay":
+		return "gostrelay"
+	}
+	return proxyType
 }
 
 func (s *Smart) getASNCode(metadata *C.Metadata) string {
@@ -1474,7 +1649,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	wildcardTarget := metadata.WildcardTarget
 	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, proxyName)
 	asnNumber := s.getASNCode(metadata)
-	priorityFactor := s.getPriorityFactor(proxyName)
+	priorityFactor := s.getPriorityFactor(proxy)
 
 	debugEnabled := log.DebugEnabled()
 	var addressDisplay string

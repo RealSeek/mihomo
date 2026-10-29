@@ -166,10 +166,14 @@ proxy-groups:
     prefer-ipv6: true         # 优先选择确认具备可用 IPv6 出站的节点
     prefer-asn: true          # 基于目标 ASN 进行服务聚合与粘性调度，大幅降低跨节点抖动
     penalize-unstable: true   # 对经常握手成功但无法收发数据的断流节点实施动态降权惩罚
+    strategy: sticky-sessions # 同一源 IP + 目标固定到首次成功的节点（默认空 = 每次按权重选）
+    type-priority: 'ss:1.2;vless:1.1;vmess:0.8'  # 按协议类型加权，与 policy-priority 相乘
 ```
 
 - **机制说明**：采用**延时惩罚降权机制**而非直接剔除节点。当延迟相近时优先调度真实可用的节点；若探测不通或网络波动，节点仍保留在候选池作为备选。
 - **独立探测通道**：UDP/IPv6 探针走独立通道，不污染 Web 面板上的常规延迟与存活状态。
+- **`strategy`（smart 专用，默认空）**：只接受 `sticky-sessions`，其他值会在加载配置时报错。同一源 IP + 同一目标（域名 / 目标 IP）在 10 分钟内固定使用首次成功的节点；只有节点离开分组、被判定阻断 / 该主机失败、健康检查不存活，或该网络需要 UDP 而节点不支持时才重新选择。适合登录态、人机验证、同一会话多次连接的服务。
+- **`type-priority`（smart 专用）**：按代理协议类型加权，键使用内核 `type` 字段的小写形式（`ss` / `shadowsocks`、`ssr`、`vless`、`vmess`、`trojan`、`hysteria2`、`tuic`、`wireguard`…），`ss`、`ssr`、`gost-relay` 会自动归一。它与 `policy-priority` 相乘；两者都是**先比权重因子、后比延迟**，所以 `1.2` 已经意味着“只要节点存活就优先”，不要当成同延迟下的微调。因子必须大于 0。
 - **配置注意**：
   - smart 策略组的健康检查参数为同级字段（`url` / `interval` / `lazy`），无需嵌套 `health-check` 字段。
   - `sample-rate` 仅控制 LightGBM 训练样本采集比例，非全局省电开关。
@@ -243,6 +247,8 @@ use: &use
   prefer-udp: true
   prefer-ipv6: true
   prefer-asn: true              # 开启基于 ASN 的会话粘性调度
+  strategy: sticky-sessions     # 同一源 IP + 目标固定到首次成功的节点
+  type-priority: 'ss:1.2;vless:1.1'   # 按协议类型加权，与下面的名称权重相乘
   policy-priority: '\[备用机场\]:0.3'    # smart 原生权重调整
   url: https://cp.cloudflare.com
   interval: 300

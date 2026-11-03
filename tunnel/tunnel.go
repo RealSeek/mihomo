@@ -30,6 +30,8 @@ import (
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 
+	"github.com/metacubex/mipstack"
+	"github.com/metacubex/sing/common"
 	"golang.org/x/exp/slices"
 )
 
@@ -696,7 +698,36 @@ func handleTCPConn(connCtx C.ConnContext) {
 	peekMutex.Lock()
 	defer peekMutex.Unlock()
 	_ = conn.SetReadDeadline(time.Time{}) // reset
-	handleSocket(conn, remoteConn)
+	started := time.Now()
+	result := N.Relay(conn, remoteConn)
+	first, firstErr := "client->remote", result.LeftToRight.Err
+	if result.First == N.RelayRightToLeft {
+		first, firstErr = "remote->client", result.RightToLeft.Err
+	}
+	// The other copy may only have failed because Relay closed a socket after
+	// the first result. Keep both errors and their order instead of blaming that
+	// induced error. A nil copy error includes an orderly EOF.
+	abnormalTUN := metadata.Type == C.TUN && firstErr != nil && !errors.Is(firstErr, net.ErrClosed)
+	if abnormalTUN || log.DebugEnabled() {
+		writeLog := log.Debugln
+		if abnormalTUN {
+			writeLog = log.Warnln
+		}
+		writeLog("[TCP close] id=%s %s --> %s using %s duration=%s first=%s upload=%d upload-error=%v download=%d download-error=%v",
+			dialMetadata.UUID, metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String(),
+			time.Since(started).Round(time.Millisecond), first, result.LeftToRight.Bytes, result.LeftToRight.Err,
+			result.RightToLeft.Bytes, result.RightToLeft.Err)
+		if tcp, ok := common.Cast[*mipstack.TCPConn](conn); ok {
+			info := tcp.Info()
+			// This snapshot follows Relay cleanup; LastError may therefore be
+			// net.ErrClosed from cleanup. The ordered copy errors above are the
+			// evidence for which operation originally ended the connection.
+			writeLog("[TCP close mips] id=%s state=%s last-error=%v sent=%d acknowledged=%d received=%d retransmissions=%d queue-drops=%d rtt=%s rto=%s peer-window=%d receive-window=%d send-buffer=%d receive-buffer=%d in-flight=%d mtu=%d",
+				dialMetadata.UUID, info.State, info.LastError, info.BytesSent, info.BytesAcknowledged, info.BytesReceived,
+				info.Retransmissions, info.InboundQueueDrops, info.RTT, info.RetransmissionTimeout,
+				info.PeerWindow, info.ReceiveWindow, info.SendBufferSize, info.ReceiveBufferSize, info.BytesInFlight, info.PathMTU)
+		}
+	}
 }
 
 func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err error) {

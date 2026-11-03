@@ -1,0 +1,109 @@
+diff --git a/congestion_rate.go b/congestion_rate.go
+index cd20a47..be62c55 100644
+--- a/congestion_rate.go
++++ b/congestion_rate.go
+@@ -269,7 +269,9 @@ func (d *tcpDeliveryRateEstimator) finishRateSample(sample *tcpDeliveryRateSampl
+ 	if ackInterval > sendInterval {
+ 		sendInterval = ackInterval
+ 	}
+-	if sendInterval <= 0 || minimumRTT > 0 && sendInterval < minimumRTT {
++	// Compare in the compact clock's precision so truncation alone cannot
++	// reject a valid interval when minimumRTT has nanosecond precision.
++	if sendInterval <= 0 || minimumRTT > 0 && sendInterval < minimumRTT.Truncate(time.Microsecond) {
+ 		return
+ 	}
+ 	sample.interval = sendInterval
+diff --git a/congestion_rate_precision_test.go b/congestion_rate_precision_test.go
+new file mode 100644
+--- /dev/null
++++ b/congestion_rate_precision_test.go
+@@ -0,0 +1,89 @@
++package mipstack
++
++import (
++	"testing"
++	"time"
++)
++
++// Identical ordered, immediately acknowledged flights must recover the same
++// bandwidth regardless of their phase within the compact microsecond clock.
++func TestInvestigationBBRSubMicrosecondSampleRecovery(t *testing.T) {
++	const mss = 1320
++	const measuredRTT = 1200 * time.Nanosecond
++	const oldBandwidth = 5000.0
++	epoch := time.Unix(100, 0)
++	stamp := func(value time.Duration) monotonicStamp { return monotonicStamp(value) + 1 }
++	for _, phase := range []time.Duration{0, 800 * time.Nanosecond} {
++		t.Run(phase.String(), func(t *testing.T) {
++			controller := newTCPCongestionController(CongestionControlBBR)
++			window := uint32(4 * mss)
++			_, _ = controller.initialize(CongestionPhaseOpen, epoch, measuredRTT, measuredRTT, window, ^uint32(0), mss, stamp(0))
++			bbr := bbrState(t, &controller)
++			bbr.mode = bbrProbeBandwidth
++			bbr.cycleIndex = 2
++			bbr.fullBandwidthReached = true
++			bbr.bandwidth = oldBandwidth
++			bbr.bandwidthFilter.reset(0, oldBandwidth)
++			bbr.pacingRate = oldBandwidth * bbrPacingMargin
++			rtt := newRTTEstimator(tcpInitialRTO)
++			validSamples := 0
++			for round := 0; round < 8; round++ {
++				firstAt := time.Second + time.Duration(round)*558*time.Millisecond + phase
++				secondAt := firstAt + 100*time.Nanosecond
++				ackAt := secondAt + measuredRTT
++				if firstAt > secondAt || secondAt > ackAt {
++					t.Fatal("invalid event order")
++				}
++				// The first send restarts an empty flight, as the production
++				// onDataSend path does before BBR receives PacketSent.
++				_, _ = controller.delivery.onDeliveryDataSent(mss, mss, epoch.Add(firstAt), stamp(firstAt), 0, window)
++				snapshot, _ := controller.delivery.onDeliveryDataSent(mss, mss, epoch.Add(secondAt), stamp(secondAt), mss, window)
++				segment := sentTCPSegment{
++					sequence: uint32(round * 2 * mss), end: uint32((round + 1) * 2 * mss),
++					hostQueue: packetQueueTicket{queuedAt: stamp(secondAt)},
++					delivery:  snapshot, state: sentTCPSegmentTransmitted,
++				}
++				var sample tcpDeliveryRateSample
++				sample.observe(segment)
++				rtt.observeAt(measuredRTT, stamp(ackAt))
++				controller.finishDeliveryRateSample(&sample, 2*mss, 2*mss, 0, epoch.Add(ackAt), stamp(ackAt), rtt.minimum, rtt.srtt, measuredRTT, false)
++				window, _ = controller.onDeliveryRateSample(window, ^uint32(0), mss, segment.end, &sample)
++				if sample.valid {
++					validSamples++
++				}
++				if round == 0 {
++					t.Logf("raw send phase=%v raw ACK phase=%v actual RTT=%v retained minimum RTT=%v compact ACK phase=%v valid=%t delivery-rate=%.0f B/s pacing-rate=%.0f B/s",
++						secondAt-firstAt, ackAt-firstAt, measuredRTT, rtt.minimum,
++						tcpDeliveryTimestampDuration(tcpDeliveryTimestampAt(stamp(ackAt)), snapshot.deliveredStamp),
++						sample.valid, bbr.bandwidth, bbr.pacingRate)
++				}
++			}
++			if rtt.minimum != measuredRTT {
++				t.Fatalf("minimum RTT changed precision: %v, want %v", rtt.minimum, measuredRTT)
++			}
++			if validSamples == 0 || bbr.bandwidth <= oldBandwidth {
++				t.Fatalf("eight immediately ACKed flights failed to recover bandwidth: valid=%d bandwidth=%.0f B/s pacing=%.0f B/s minimum-RTT=%v",
++					validSamples, bbr.bandwidth, bbr.pacingRate, rtt.minimum)
++			}
++		})
++	}
++}
++
++func TestInvestigationDeliveryRateRejectsIntervalBelowMinimumRTT(t *testing.T) {
++	firstSent := monotonicStamp(time.Second) + 1
++	lastSent := firstSent + monotonicStamp(100*time.Nanosecond)
++	acknowledgedAt := firstSent + monotonicStamp(1300*time.Nanosecond)
++	estimator := tcpDeliveryRateEstimator{}
++	estimator.restartFlight(firstSent)
++	segment := sentTCPSegment{
++		sequence: 1, end: 1321,
++		hostQueue: packetQueueTicket{queuedAt: lastSent},
++		delivery:  estimator.snapshot(), state: sentTCPSegmentTransmitted,
++	}
++	var sample tcpDeliveryRateSample
++	sample.observe(segment)
++	estimator.finishRateSample(&sample, 1320, 1320, 0, time.Unix(100, 0), acknowledgedAt, 2200*time.Nanosecond, 2200*time.Nanosecond, 1200*time.Nanosecond)
++	if sample.valid {
++		t.Fatal("one-microsecond interval passed a two-microsecond minimum-RTT threshold")
++	}
++}

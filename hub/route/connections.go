@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 
 	"github.com/metacubex/chi"
@@ -81,16 +82,21 @@ func getConnections(w http.ResponseWriter, r *http.Request) {
 func closeConnection(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if c := statistic.DefaultManager.Get(id); c != nil {
+		log.Infoln("[API] close connection id=%s source=%s destination=%s",
+			id, c.Info().Metadata.SourceDetail(), c.Info().Metadata.RemoteAddress())
 		_ = c.Close()
 	}
 	render.NoContent(w, r)
 }
 
 func closeAllConnections(w http.ResponseWriter, r *http.Request) {
+	closed := 0
 	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
+		closed++
 		_ = c.Close()
 		return true
 	})
+	log.Infoln("[API] close all connections count=%d", closed)
 	render.NoContent(w, r)
 }
 

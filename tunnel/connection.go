@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
@@ -215,8 +214,4 @@ func closeAllLocalCoon(lAddr string) {
 		log.Debugln("Closing TProxy local conn... lAddr=%s rAddr=%s", lAddr, key)
 		return true
 	})
-}
-
-func handleSocket(inbound, outbound net.Conn) {
-	N.Relay(inbound, outbound)
 }

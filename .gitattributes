@@ -1,0 +1,2 @@
+# Patch context preserves the target source's indentation.
+docs/patches/*.patch text eol=lf -whitespace

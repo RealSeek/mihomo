@@ -3,6 +3,7 @@ package net
 import (
 	"io"
 	"net"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/common/net/deadline"
 
@@ -66,15 +67,19 @@ func closeWrite(writer io.Closer) error {
 
 // Relay copies between left and right bidirectionally.
 // like [bufio.CopyConn] but remove unneeded [context.Context] handle and the cost of [task.Group]
-func Relay(leftConn, rightConn net.Conn) {
+// The first copy result is recorded before its cleanup can interrupt the other copy.
+func Relay(leftConn, rightConn net.Conn) (result RelayResult) {
 	defer func() {
 		_ = leftConn.Close()
 		_ = rightConn.Close()
 	}()
 
+	var first atomic.Uint32
 	ch := make(chan struct{})
 	go func() {
-		_, err := bufio.Copy(leftConn, rightConn)
+		n, err := bufio.Copy(leftConn, rightConn)
+		result.RightToLeft = RelayCopyResult{Bytes: n, Err: err}
+		first.CompareAndSwap(0, uint32(RelayRightToLeft))
 		if err == nil {
 			_ = closeWrite(leftConn)
 		} else {
@@ -83,11 +88,34 @@ func Relay(leftConn, rightConn net.Conn) {
 		close(ch)
 	}()
 
-	_, err := bufio.Copy(rightConn, leftConn)
+	n, err := bufio.Copy(rightConn, leftConn)
+	result.LeftToRight = RelayCopyResult{Bytes: n, Err: err}
+	first.CompareAndSwap(0, uint32(RelayLeftToRight))
 	if err == nil {
 		_ = closeWrite(rightConn)
 	} else {
 		_ = rightConn.Close()
 	}
 	<-ch
+	result.First = RelayDirection(first.Load())
+	return
+}
+
+type RelayDirection uint8
+
+const (
+	RelayLeftToRight RelayDirection = iota + 1
+	RelayRightToLeft
+)
+
+type RelayCopyResult struct {
+	Bytes int64
+	// Err is nil for EOF, which bufio.Copy treats as a successful copy.
+	Err error
+}
+
+type RelayResult struct {
+	LeftToRight RelayCopyResult
+	RightToLeft RelayCopyResult
+	First       RelayDirection
 }

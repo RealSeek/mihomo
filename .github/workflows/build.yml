@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tag version to release"
-        required: true
+        description: "Release tag (leave empty to publish the latest Alpha build)"
+        required: false
   push:
     branches:
       - Alpha
@@ -26,6 +26,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     strategy:
       matrix:
         jobs:
@@ -122,15 +124,22 @@ jobs:
       run: go env
 
     - name: Set variables
+      id: version
+      env:
+        RELEASE_VERSION: ${{ inputs.version }}
       run: |
         VERSION="alpha-smart-$(git rev-parse --short HEAD)-ebpf"
         VERSION="${VERSION//\//-}"
         PackageVersion="$(curl -s "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | jq -r '.tag_name' | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
-        if [ -n "${{ github.event.inputs.version }}" ]; then
-          VERSION=${{ github.event.inputs.version }}
+        if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          RELEASE_VERSION="${GITHUB_REF_NAME}"
+        fi
+        if [ -n "${RELEASE_VERSION}" ]; then
+          VERSION="${RELEASE_VERSION}"
           PackageVersion="${VERSION#v}"
         fi
         echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
         echo "PackageVersion=${PackageVersion}-smart" >> $GITHUB_ENV
       
         echo "BUILDTIME=$(date)" >> $GITHUB_ENV
@@ -276,7 +285,7 @@ jobs:
 
   Upload-Prerelease:
     permissions: write-all
-    if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' && !startsWith(github.event_name, 'pull_request') }}
+    if: ${{ github.ref == 'refs/heads/Alpha' && inputs.version == '' }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -341,45 +350,15 @@ jobs:
 
   Upload-Release:
     permissions: write-all
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
+    if: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.version != '') }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: Meta
           fetch-depth: '0'
           fetch-tags: 'true'
-
-      - name: Get tags
-        run: |
-          echo "CURRENTVERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
-          git fetch --tags
-          echo "PREVERSION=$(git describe --tags --abbrev=0 HEAD)" >> $GITHUB_ENV
-
-      - name: Force push Alpha branch to Meta
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git fetch origin Alpha:Alpha
-          git push origin Alpha:Meta --force
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag the commit on Alpha
-        run: |
-          git checkout Alpha 
-          git tag ${{ github.event.inputs.version }}
-          git push origin ${{ github.event.inputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate release notes
-        run: |
-            cp ./.github/genReleaseNote.sh ./
-            bash ./genReleaseNote.sh -v ${PREVERSION}...${CURRENTVERSION}
-            rm ./genReleaseNote.sh
   
       - uses: actions/download-artifact@v8
         with:
@@ -394,9 +373,10 @@ jobs:
         uses: softprops/action-gh-release@v3
         if: ${{ success() }}
         with:
-          tag_name: ${{ github.event.inputs.version }}
+          tag_name: ${{ needs.build.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: bin/*
-          body_path: release.md
+          generate_release_notes: true
 
   Docker:
     if: ${{ !startsWith(github.event_name, 'pull_request') }}
@@ -429,7 +409,7 @@ jobs:
       # Extract metadata (tags, labels) for Docker
       # https://github.com/docker/metadata-action
       - name: Extract Docker metadata
-        if: ${{ github.event_name != 'workflow_dispatch' }}
+        if: ${{ inputs.version == '' }}
         id: meta_alpha
         uses: docker/metadata-action@v6
         with:
@@ -464,7 +444,7 @@ jobs:
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
       - name: Build and push Docker image
-        if: ${{ github.event_name != 'workflow_dispatch' }}
+        if: ${{ inputs.version == '' }}
         uses: docker/build-push-action@v7
         with:
           context: .

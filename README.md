@@ -4,9 +4,9 @@
 </h1>
 
 <p align="center">
-  <a href="https://github.com/liuran001/mihomo/actions"><img src="https://img.shields.io/github/actions/workflow/status/liuran001/mihomo/build.yml?branch=Alpha&style=flat-square&label=build"></a>
-  <img src="https://img.shields.io/github/go-mod/go-version/liuran001/mihomo/Alpha?style=flat-square">
-  <a href="https://github.com/liuran001/mihomo/releases"><img src="https://img.shields.io/github/release/liuran001/mihomo/all.svg?style=flat-square"></a>
+  <a href="https://github.com/RealSeek/mihomo/actions"><img src="https://img.shields.io/github/actions/workflow/status/RealSeek/mihomo/build.yml?branch=Alpha&style=flat-square&label=build"></a>
+  <img src="https://img.shields.io/github/go-mod/go-version/RealSeek/mihomo/Alpha?style=flat-square">
+  <a href="https://github.com/RealSeek/mihomo/releases"><img src="https://img.shields.io/github/release/RealSeek/mihomo/all.svg?style=flat-square"></a>
 </p>
 
 一个面向**随身 WiFi / 手机热点 / 旁路由网关**深度优化的 [mihomo](https://github.com/MetaCubeX/mihomo) 分支。以 [vernesong](https://github.com/vernesong/mihomo) smart 内核为底，合入 [TanakaLun](https://github.com/TanakaLun/mihomo/tree/ebpf-inbound) / [CHIZI-0618](https://github.com/CHIZI-0618/sing-box) 的 eBPF 透明入站，并增强了 Tailscale 双向网关与节点智能优选能力。

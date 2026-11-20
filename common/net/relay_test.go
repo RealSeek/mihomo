@@ -8,6 +8,9 @@ import (
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+
+	"github.com/metacubex/sing/common/buf"
+	"github.com/metacubex/sing/common/bufio"
 )
 
 func TestRelayHalfCloseAndReset(t *testing.T) {
@@ -34,36 +37,45 @@ func TestRelayHalfCloseAndReset(t *testing.T) {
 		return client, server
 	}
 
-	t.Run("half-close keeps reply", func(t *testing.T) {
-		client, left := pair(t)
-		right, server := pair(t)
-		done := make(chan N.RelayResult, 1)
-		go func() { done <- N.Relay(left, right) }()
-		if _, err := client.Write([]byte("request")); err != nil {
-			t.Fatal(err)
-		}
-		if err := client.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		request, err := io.ReadAll(server)
-		if err != nil || string(request) != "request" {
-			t.Fatalf("server request = %q, %v", request, err)
-		}
-		if _, err := server.Write([]byte("reply")); err != nil {
-			t.Fatal(err)
-		}
-		if err := server.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		reply, err := io.ReadAll(client)
-		if err != nil || string(reply) != "reply" {
-			t.Fatalf("client reply = %q, %v", reply, err)
-		}
-		result := <-done
-		if result.First != N.RelayLeftToRight || result.LeftToRight.Bytes != 7 || result.RightToLeft.Bytes != 5 || result.LeftToRight.Err != nil || result.RightToLeft.Err != nil {
-			t.Fatalf("relay result = %+v", result)
-		}
-	})
+	for name, prefix := range map[string]string{
+		"half-close keeps reply":           "",
+		"half-close counts cached request": "cached-",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client, left := pair(t)
+			right, server := pair(t)
+			var relayLeft net.Conn = left
+			if prefix != "" {
+				relayLeft = bufio.NewCachedConn(left, buf.As([]byte(prefix)))
+			}
+			done := make(chan N.RelayResult, 1)
+			go func() { done <- N.Relay(relayLeft, right) }()
+			if _, err := client.Write([]byte("request")); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			request, err := io.ReadAll(server)
+			if err != nil || string(request) != prefix+"request" {
+				t.Fatalf("server request = %q, %v", request, err)
+			}
+			if _, err := server.Write([]byte("reply")); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			reply, err := io.ReadAll(client)
+			if err != nil || string(reply) != "reply" {
+				t.Fatalf("client reply = %q, %v", reply, err)
+			}
+			result := <-done
+			if result.First != N.RelayLeftToRight || result.LeftToRight.Bytes != int64(len(prefix)+7) || result.RightToLeft.Bytes != 5 || result.LeftToRight.Err != nil || result.RightToLeft.Err != nil {
+				t.Fatalf("relay result = %+v", result)
+			}
+		})
+	}
 
 	t.Run("remote reset precedes induced close", func(t *testing.T) {
 		_, left := pair(t)

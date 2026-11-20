@@ -75,10 +75,16 @@ func Relay(leftConn, rightConn net.Conn) (result RelayResult) {
 	}()
 
 	var first atomic.Uint32
+	// The splice path in sing reports bytes through counters but returns zero.
+	// Counters also include cached data while preserving the optimized copy path.
+	countedLeft := bufio.NewCounterConn(leftConn,
+		[]network.CountFunc{func(n int64) { result.LeftToRight.Bytes += n }},
+		[]network.CountFunc{func(n int64) { result.RightToLeft.Bytes += n }},
+	)
 	ch := make(chan struct{})
 	go func() {
-		n, err := bufio.Copy(leftConn, rightConn)
-		result.RightToLeft = RelayCopyResult{Bytes: n, Err: err}
+		_, err := bufio.Copy(countedLeft, rightConn)
+		result.RightToLeft.Err = err
 		first.CompareAndSwap(0, uint32(RelayRightToLeft))
 		if err == nil {
 			_ = closeWrite(leftConn)
@@ -88,8 +94,8 @@ func Relay(leftConn, rightConn net.Conn) (result RelayResult) {
 		close(ch)
 	}()
 
-	n, err := bufio.Copy(rightConn, leftConn)
-	result.LeftToRight = RelayCopyResult{Bytes: n, Err: err}
+	_, err := bufio.Copy(rightConn, countedLeft)
+	result.LeftToRight.Err = err
 	first.CompareAndSwap(0, uint32(RelayLeftToRight))
 	if err == nil {
 		_ = closeWrite(rightConn)

@@ -73,6 +73,14 @@ func (t *TrackerInfo) AwaitingReply(now time.Time, d time.Duration) bool {
 	return now.UnixNano()-sent >= int64(d)
 }
 
+// ReplyPending reports whether the last payload went out with nothing back
+// since, however recently: a connection AwaitingReply accepts once enough time
+// passes. Without one, only a new upload can make a connection look stuck.
+func (t *TrackerInfo) ReplyPending() bool {
+	sent := t.LastUpload.Load()
+	return sent != 0 && t.LastDownload.Load() < sent
+}
+
 func noteTraffic(stamp *atomic.Int64, n int64) {
 	if n > 0 {
 		stamp.Store(time.Now().UnixNano())
@@ -100,6 +108,7 @@ type tcpTracker struct {
 	manager *Manager
 
 	pushToManager bool `json:"-"`
+	source        *sourceCounter
 	initialUpload int64
 	closeOnce     sync.Once
 	closeErr      error
@@ -121,6 +130,7 @@ func (tt *tcpTracker) Read(b []byte) (int, error) {
 	download := int64(n)
 	if tt.pushToManager {
 		tt.manager.PushDownloaded(download)
+		tt.source.addDownload(download)
 	}
 	tt.DownloadTotal.Add(download)
 	noteTraffic(&tt.LastDownload, download)
@@ -133,6 +143,7 @@ func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
 	download := int64(buffer.Len())
 	if tt.pushToManager {
 		tt.manager.PushDownloaded(download)
+		tt.source.addDownload(download)
 	}
 	tt.DownloadTotal.Add(download)
 	noteTraffic(&tt.LastDownload, download)
@@ -144,6 +155,7 @@ func (tt *tcpTracker) UnwrapReader() (io.Reader, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(download int64) {
 		if tt.pushToManager {
 			tt.manager.PushDownloaded(download)
+			tt.source.addDownload(download)
 		}
 		tt.DownloadTotal.Add(download)
 		noteTraffic(&tt.LastDownload, download)
@@ -156,9 +168,10 @@ func (tt *tcpTracker) Write(b []byte) (int, error) {
 	upload := int64(n)
 	if tt.pushToManager {
 		tt.manager.PushUploaded(upload)
+		tt.source.addUpload(upload)
 	}
 	tt.UploadTotal.Add(upload)
-	noteTraffic(&tt.LastUpload, upload)
+	tt.manager.noteUpload(&tt.LastUpload, upload)
 	tt.TrackerInfo.MaxUploadRate.Store(tt.uploadBucketWindow.updateMaxRate(upload))
 	return n, err
 }
@@ -168,9 +181,10 @@ func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 	err = tt.Conn.WriteBuffer(buffer)
 	if tt.pushToManager {
 		tt.manager.PushUploaded(upload)
+		tt.source.addUpload(upload)
 	}
 	tt.UploadTotal.Add(upload)
-	noteTraffic(&tt.LastUpload, upload)
+	tt.manager.noteUpload(&tt.LastUpload, upload)
 	tt.TrackerInfo.MaxUploadRate.Store(tt.uploadBucketWindow.updateMaxRate(upload))
 	return
 }
@@ -179,9 +193,10 @@ func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(upload int64) {
 		if tt.pushToManager {
 			tt.manager.PushUploaded(upload)
+			tt.source.addUpload(upload)
 		}
 		tt.UploadTotal.Add(upload)
-		noteTraffic(&tt.LastUpload, upload)
+		tt.manager.noteUpload(&tt.LastUpload, upload)
 		tt.TrackerInfo.MaxUploadRate.Store(tt.uploadBucketWindow.updateMaxRate(upload))
 	}}
 }
@@ -190,6 +205,7 @@ func (tt *tcpTracker) Close() error {
 	tt.closeOnce.Do(func() {
 		tt.closeErr = tt.Conn.Close()
 		tt.manager.Leave(tt)
+		tt.source.release()
 		tt.reportStall()
 	})
 	return tt.closeErr
@@ -264,6 +280,11 @@ func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.R
 	t.stampInitialTraffic(uploadTotal, downloadTotal)
 
 	if pushToManager {
+		// Only trackers that feed the manager totals count per source;
+		// dialer-proxy and DNS trackers would count the same bytes twice.
+		t.source = manager.sourceCounterFor(metadata)
+		t.source.addUpload(uploadTotal)
+		t.source.addDownload(downloadTotal)
 		if uploadTotal > 0 {
 			manager.PushUploaded(uploadTotal)
 		}
@@ -287,6 +308,7 @@ type udpTracker struct {
 	manager *Manager
 
 	pushToManager bool `json:"-"`
+	source        *sourceCounter
 	closeOnce     sync.Once
 	closeErr      error
 
@@ -307,6 +329,7 @@ func (ut *udpTracker) ReadFrom(b []byte) (int, net.Addr, error) {
 	download := int64(n)
 	if ut.pushToManager {
 		ut.manager.PushDownloaded(download)
+		ut.source.addDownload(download)
 	}
 	ut.DownloadTotal.Add(download)
 	noteTraffic(&ut.LastDownload, download)
@@ -319,6 +342,7 @@ func (ut *udpTracker) WaitReadFrom() (data []byte, put func(), addr net.Addr, er
 	download := int64(len(data))
 	if ut.pushToManager {
 		ut.manager.PushDownloaded(download)
+		ut.source.addDownload(download)
 	}
 	ut.DownloadTotal.Add(download)
 	noteTraffic(&ut.LastDownload, download)
@@ -331,9 +355,10 @@ func (ut *udpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
 	upload := int64(n)
 	if ut.pushToManager {
 		ut.manager.PushUploaded(upload)
+		ut.source.addUpload(upload)
 	}
 	ut.UploadTotal.Add(upload)
-	noteTraffic(&ut.LastUpload, upload)
+	ut.manager.noteUpload(&ut.LastUpload, upload)
 	ut.TrackerInfo.MaxUploadRate.Store(ut.uploadBucketWindow.updateMaxRate(upload))
 	return n, err
 }
@@ -342,6 +367,7 @@ func (ut *udpTracker) Close() error {
 	ut.closeOnce.Do(func() {
 		ut.closeErr = ut.PacketConn.Close()
 		ut.manager.Leave(ut)
+		ut.source.release()
 	})
 	return ut.closeErr
 }
@@ -378,6 +404,9 @@ func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, ru
 	ut.stampInitialTraffic(uploadTotal, downloadTotal)
 
 	if pushToManager {
+		ut.source = manager.sourceCounterFor(metadata)
+		ut.source.addUpload(uploadTotal)
+		ut.source.addDownload(downloadTotal)
 		if uploadTotal > 0 {
 			manager.PushUploaded(uploadTotal)
 		}

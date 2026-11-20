@@ -2,8 +2,10 @@ package statistic
 
 import (
 	"context"
+	"net/netip"
 	"os"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -43,11 +45,60 @@ type Manager struct {
 	memoryUpdated time.Time
 	trafficActive atomic.Bool
 	trafficWake   chan struct{}
+
+	// uploadWait is closed by the next upload once UploadSignal armed it.
+	// uploadArmed lets the write path skip the lock while nobody waits.
+	uploadArmed  atomic.Bool
+	uploadWaitMu sync.Mutex
+	uploadWait   chan struct{}
+
+	// Per-source traffic counters, see source.go.
+	sources     xsync.Map[netip.Addr, *sourceCounter]
+	sourceCount stdatomic.Int32
+	sourceSweep stdatomic.Int64
 }
 
 func (m *Manager) Join(c Tracker) {
 	m.connections.Store(c.ID(), c)
 	m.joinSmartTarget(c)
+	// Bytes counted before tracking began are already stamped; announce them
+	// as an upload of their own, after the connection is visible to Range.
+	if c.Info().LastUpload.Load() != 0 {
+		m.signalUpload()
+	}
+}
+
+// UploadSignal returns a channel closed by the next upload on any tracked
+// connection. Arm it before scanning connections: an upload either lands in the
+// scan or closes the channel, so a waiter that found nothing to do never misses
+// the one that gives it work.
+func (m *Manager) UploadSignal() <-chan struct{} {
+	m.uploadWaitMu.Lock()
+	defer m.uploadWaitMu.Unlock()
+	if m.uploadWait == nil {
+		m.uploadWait = make(chan struct{})
+		m.uploadArmed.Store(true)
+	}
+	return m.uploadWait
+}
+
+func (m *Manager) noteUpload(stamp *atomic.Int64, n int64) {
+	noteTraffic(stamp, n)
+	if n > 0 {
+		m.signalUpload()
+	}
+}
+
+func (m *Manager) signalUpload() {
+	if !m.uploadArmed.Load() {
+		return
+	}
+	m.uploadWaitMu.Lock()
+	if m.uploadArmed.CompareAndSwap(true, false) {
+		close(m.uploadWait)
+		m.uploadWait = nil
+	}
+	m.uploadWaitMu.Unlock()
 }
 
 func (m *Manager) Leave(c Tracker) {
@@ -111,6 +162,22 @@ func (m *Manager) Snapshot() *Snapshot {
 	}
 }
 
+type TrafficSummary struct {
+	DownloadTotal   int64  `json:"downloadTotal"`
+	UploadTotal     int64  `json:"uploadTotal"`
+	ConnectionCount int    `json:"connectionCount"`
+	Memory          uint64 `json:"memory"`
+}
+
+func (m *Manager) Summary() TrafficSummary {
+	return TrafficSummary{
+		DownloadTotal:   m.downloadTotal.Load(),
+		UploadTotal:     m.uploadTotal.Load(),
+		ConnectionCount: m.connections.Size(),
+		Memory:          m.Memory(),
+	}
+}
+
 func (m *Manager) updateMemory() {
 	m.memoryMu.Lock()
 	defer m.memoryMu.Unlock()
@@ -134,6 +201,7 @@ func (m *Manager) ResetStatistic() {
 	m.downloadTemp.Store(0)
 	m.downloadBlip.Store(0)
 	m.downloadTotal.Store(0)
+	m.resetSources()
 }
 
 func (m *Manager) wakeTraffic() {

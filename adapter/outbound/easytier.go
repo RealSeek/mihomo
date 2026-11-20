@@ -425,7 +425,21 @@ func (e *EasyTier) init() error {
 		return err
 	}
 	log.Infoln("[EasyTier](%s) instance %s running", e.Name(), instance.ID())
+	if !e.option.PacketMode {
+		go e.drainHostPackets(instance)
+	}
 	return nil
+}
+
+// Outside packet mode, the outbound uses the core's netstack. Drain unused
+// raw IP packets so the bounded host packet queue cannot stall the data plane.
+// ReceivePacket unblocks when the instance closes or the adapter is canceled.
+func (e *EasyTier) drainHostPackets(instance *corehost.Instance) {
+	for {
+		if _, err := instance.ReceivePacket(e.ctx); err != nil {
+			return
+		}
+	}
 }
 
 func (e *EasyTier) currentInstance() (*corehost.Instance, error) {

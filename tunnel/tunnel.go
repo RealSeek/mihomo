@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -706,8 +707,9 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 	// The other copy may only have failed because Relay closed a socket after
 	// the first result. Keep both errors and their order instead of blaming that
-	// induced error. A nil copy error includes an orderly EOF.
-	abnormalTUN := metadata.Type == C.TUN && firstErr != nil && !errors.Is(firstErr, net.ErrClosed)
+	// induced error. REJECT can also return EOF from a write; it is an expected
+	// close, not a TUN failure.
+	abnormalTUN := metadata.Type == C.TUN && firstErr != nil && !errors.Is(firstErr, io.EOF) && !errors.Is(firstErr, net.ErrClosed)
 	if abnormalTUN || log.DebugEnabled() {
 		writeLog := log.Debugln
 		if abnormalTUN {
